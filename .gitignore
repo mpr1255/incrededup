@@ -1,0 +1,14 @@
+/target/
+.env
+.DS_Store
+*.log
+data/
+out/
+tmp/
+scratch/
+agents/
+notes/
+rensa-upstream/
+PLAN.md
+TODO.md
+todo.md
