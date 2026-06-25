@@ -200,7 +200,7 @@ Options:
           [default: 60]
 
       --search-index-error-backoff-secs <SEARCH_INDEX_ERROR_BACKOFF_SECS>
-          Seconds to back off a dataset after pg_search/Tantivy index corruption is detected
+          Seconds to back off after transient search-index corruption is detected
           
           [default: 600]
 

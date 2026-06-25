@@ -220,7 +220,7 @@ pub struct Args {
     #[arg(long, default_value = "60")]
     pub memory_idle_timeout: u64,
 
-    /// Seconds to back off a dataset after pg_search/Tantivy index corruption is detected
+    /// Seconds to back off after transient search-index corruption is detected
     #[arg(long, default_value = "600")]
     pub search_index_error_backoff_secs: u64,
 }
