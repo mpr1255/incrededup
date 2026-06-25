@@ -91,8 +91,8 @@ pub struct DedupeConfig {
     pub skip_db_write: bool,
     /// Use disk-based Phase 2 instead of in-memory (lower RAM, slower)
     pub disk_phase2: bool,
-    /// Minimum content length to index (documents shorter than this are skipped)
-    /// Documents <= this length are too short for meaningful deduplication
+    /// Minimum UTF-8 byte length to index; shorter documents are skipped.
+    /// Documents <= this length are too short for meaningful deduplication.
     /// Default: 500 (matches Python version)
     pub min_content_length: i32,
     /// Lookup strategy for connected historical match edges in Phase 3.
@@ -114,7 +114,7 @@ impl Default for DedupeConfig {
             data_dir: PathBuf::from("./data"),
             skip_db_write: false,
             disk_phase2: true,
-            min_content_length: 500, // Match Python version - skip docs <= 500 chars
+            min_content_length: 500, // Match Python version - skip docs <= 500 UTF-8 bytes
             edge_lookup_mode: EdgeLookupMode::Scan,
         }
     }
@@ -1034,7 +1034,7 @@ pub async fn run_dedupe(db_config: DbConfig, dedupe_config: DedupeConfig) -> Res
     if short_doc_count > 0 || boilerplate_doc_count > 0 {
         if short_doc_count > 0 {
             info!(
-                "Skipped {} documents with content <= {} chars",
+                "Skipped {} documents with content <= {} UTF-8 bytes",
                 short_doc_count, min_content_len
             );
         }
@@ -1441,7 +1441,7 @@ pub async fn run_dedupe_with_source<S: DocumentSource>(
     if short_doc_count > 0 || boilerplate_doc_count > 0 {
         if short_doc_count > 0 {
             info!(
-                "Skipped {} documents with content <= {} chars",
+                "Skipped {} documents with content <= {} UTF-8 bytes",
                 short_doc_count, min_content_len
             );
         }

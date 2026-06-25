@@ -149,6 +149,12 @@ impl DbConfig {
         self
     }
 
+    /// Validate operator-supplied SQL identifiers before query construction.
+    pub fn validate(&self) -> Result<()> {
+        validate_table_name(&self.table_name)
+            .with_context(|| format!("Invalid table name: {}", self.table_name))
+    }
+
     /// Name used for this source's sidecar directory.
     pub fn source_name(&self) -> String {
         self.scope
@@ -242,9 +248,40 @@ fn legacy_dataset_where_sql(dataset_id: Uuid) -> String {
     )
 }
 
+fn validate_table_name(table_name: &str) -> Result<()> {
+    if table_name.is_empty() {
+        anyhow::bail!("table name must not be empty");
+    }
+
+    for part in table_name.split('.') {
+        if !is_sql_identifier(part) {
+            anyhow::bail!(
+                "table name must contain only unquoted SQL identifiers separated by dots"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_sql_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 impl DbPool {
     /// Create a new connection pool
     pub async fn new(config: DbConfig) -> Result<Self> {
+        config.validate()?;
+
         let mut cfg = Config::new();
         cfg.host = Some(config.host.clone());
         cfg.port = Some(config.port);
@@ -289,6 +326,8 @@ impl DbPool {
         config: &DbConfig,
         dataset_id: Uuid,
     ) -> Result<Option<DatasetLockGuard>> {
+        config.validate()?;
+
         let mut pg_config = tokio_postgres::Config::new();
         pg_config.host(&config.host);
         pg_config.port(config.port);
@@ -1020,5 +1059,39 @@ mod tests {
         let config = DbConfig::from_url("postgresql://user:pass@host/db").unwrap();
         assert_eq!(config.host, "host");
         assert_eq!(config.port, 5432);
+    }
+
+    #[test]
+    fn test_table_name_validation_accepts_plain_and_schema_names() {
+        let config = DbConfig::from_url("postgresql://user:pass@host/db").unwrap();
+
+        assert!(config.clone().with_table("documents").validate().is_ok());
+        assert!(config
+            .clone()
+            .with_table("public.documents_2026")
+            .validate()
+            .is_ok());
+        assert!(config.with_table("_scratch.table1").validate().is_ok());
+    }
+
+    #[test]
+    fn test_table_name_validation_rejects_sql_fragments() {
+        let config = DbConfig::from_url("postgresql://user:pass@host/db").unwrap();
+
+        for table_name in [
+            "",
+            "documents;",
+            "documents WHERE true",
+            "public.",
+            ".documents",
+            "public.documents; DROP TABLE documents",
+            "\"documents\"",
+            "2026_documents",
+        ] {
+            assert!(
+                config.clone().with_table(table_name).validate().is_err(),
+                "{table_name:?} should be rejected"
+            );
+        }
     }
 }

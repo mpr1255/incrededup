@@ -12,6 +12,9 @@ use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 
+const DOCUMENT_SELECT_COLUMNS: &str =
+    "id, COALESCE(content, ''), COALESCE(content_len, length(COALESCE(content, ''))), filename";
+
 /// SQLite document source.
 ///
 /// Uses a SQLite database to store documents. The schema mirrors the PostgreSQL
@@ -233,9 +236,10 @@ impl DocumentSource for SqliteSource {
 
         match last_id {
             Some(id) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, content, content_len, filename FROM documents WHERE id > ?1 ORDER BY id LIMIT ?2",
-                )?;
+                let query = format!(
+                    "SELECT {DOCUMENT_SELECT_COLUMNS} FROM documents WHERE id > ?1 ORDER BY id LIMIT ?2"
+                );
+                let mut stmt = conn.prepare(&query)?;
                 let rows = stmt.query_map(params![id.to_string(), limit], |row| {
                     let id_str: String = row.get(0)?;
                     Ok(SourceDocument {
@@ -250,9 +254,9 @@ impl DocumentSource for SqliteSource {
                 }
             }
             None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, content, content_len, filename FROM documents ORDER BY id LIMIT ?1",
-                )?;
+                let query =
+                    format!("SELECT {DOCUMENT_SELECT_COLUMNS} FROM documents ORDER BY id LIMIT ?1");
+                let mut stmt = conn.prepare(&query)?;
                 let rows = stmt.query_map(params![limit], |row| {
                     let id_str: String = row.get(0)?;
                     Ok(SourceDocument {
@@ -320,7 +324,7 @@ impl DocumentSource for SqliteSource {
         // Build query with placeholders
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
         let query = format!(
-            "SELECT id, content, content_len, filename FROM documents WHERE id IN ({})",
+            "SELECT {DOCUMENT_SELECT_COLUMNS} FROM documents WHERE id IN ({})",
             placeholders.join(", ")
         );
 
@@ -578,6 +582,56 @@ mod tests {
         let fetched_ids: Vec<_> = fetched.iter().map(|d| d.id).collect();
         assert!(fetched_ids.contains(&docs[0].id));
         assert!(fetched_ids.contains(&docs[2].id));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_fetch_tolerates_nullable_legacy_columns() {
+        let source = SqliteSource::in_memory().unwrap();
+        let with_content = Uuid::new_v4();
+        let without_content = Uuid::new_v4();
+
+        {
+            let conn = source.conn.lock().unwrap();
+            conn.execute_batch(
+                r#"
+                DROP TABLE documents;
+                CREATE TABLE documents (
+                    id TEXT PRIMARY KEY,
+                    content TEXT,
+                    content_len INTEGER,
+                    filename TEXT,
+                    is_parent INTEGER
+                );
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO documents (id, content, content_len, filename, is_parent) VALUES (?1, ?2, NULL, ?3, NULL)",
+                rusqlite::params![with_content.to_string(), "abc", "with_content.txt"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO documents (id, content, content_len, filename, is_parent) VALUES (?1, NULL, NULL, ?2, NULL)",
+                rusqlite::params![without_content.to_string(), "without_content.txt"],
+            )
+            .unwrap();
+        }
+
+        let fetched = source.fetch_all_after(None, 10).await.unwrap();
+        assert_eq!(fetched.len(), 2);
+
+        let doc = fetched.iter().find(|doc| doc.id == with_content).unwrap();
+        assert_eq!(doc.content, "abc");
+        assert_eq!(doc.content_len, 3);
+
+        let doc = source
+            .fetch_by_ids(&[without_content])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(doc.content, "");
+        assert_eq!(doc.content_len, 0);
     }
 
     #[tokio::test]

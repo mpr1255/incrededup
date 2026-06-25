@@ -147,7 +147,7 @@ pub struct Args {
     #[arg(long)]
     pub log_file: Option<PathBuf>,
 
-    /// Minimum content length to index.
+    /// Minimum UTF-8 byte length to index.
     ///
     /// Shorter documents are skipped and marked as parents.
     #[arg(long, default_value = "500")]

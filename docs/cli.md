@@ -125,7 +125,7 @@ Options:
           Log file path (for daemon mode). Logs to stdout if not specified
 
       --min-content-len <MIN_CONTENT_LEN>
-          Minimum content length to index.
+          Minimum UTF-8 byte length to index.
           
           Shorter documents are skipped and marked as parents.
           

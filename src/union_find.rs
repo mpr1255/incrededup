@@ -65,14 +65,22 @@ impl UnionFind {
     /// Path compression flattens the tree structure for faster subsequent lookups.
     /// Returns the node itself if it hasn't been added to any set.
     pub fn find(&mut self, x: Uuid) -> Uuid {
-        if let Some(&p) = self.parent.get(&x) {
-            if p != x {
-                let root = self.find(p);
-                self.parent.insert(x, root);
-                return root;
+        let mut node = x;
+        let mut path = Vec::new();
+
+        while let Some(&parent) = self.parent.get(&node) {
+            if parent == node {
+                break;
             }
+            path.push(node);
+            node = parent;
         }
-        x
+
+        for child in path {
+            self.parent.insert(child, node);
+        }
+
+        node
     }
 
     /// Union two sets, using lexicographically smaller UUID as root.
@@ -284,6 +292,21 @@ mod tests {
 
         // Now d should point directly to a (path compressed)
         assert_eq!(uf.find(d), a);
+    }
+
+    #[test]
+    fn test_find_handles_long_chain_iteratively() {
+        let mut uf = UnionFind::new();
+        let root = Uuid::from_u128(0);
+        uf.parent.insert(root, root);
+
+        for i in 1..=20_000u128 {
+            uf.parent.insert(Uuid::from_u128(i), Uuid::from_u128(i - 1));
+        }
+
+        let tail = Uuid::from_u128(20_000);
+        assert_eq!(uf.find(tail), root);
+        assert_eq!(uf.parent.get(&tail), Some(&root));
     }
 
     #[test]

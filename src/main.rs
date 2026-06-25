@@ -73,10 +73,8 @@ fn is_search_index_corruption_error(error: &anyhow::Error) -> bool {
         || (message.contains("pg_search") && message.contains("corrupt"))
 }
 
-/// Release memory back to the OS (Linux only).
-/// Calls malloc_trim(0) to return unused heap memory to the system.
-/// On non-Linux platforms, this is a no-op.
-#[cfg(target_os = "linux")]
+/// Release memory back to the OS with glibc malloc_trim where available.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn release_memory_to_os() {
     extern "C" {
         fn malloc_trim(pad: usize) -> i32;
@@ -99,9 +97,9 @@ fn release_memory_to_os() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn release_memory_to_os() {
-    // No-op on non-Linux platforms
+    // No-op where malloc_trim is unavailable.
 }
 
 /// Custom timer that uses local time (chrono)
@@ -213,7 +211,7 @@ async fn main() -> Result<()> {
             "    incrededup --postgres --scope <name> --scope-where <sql> PostgreSQL scoped table"
         );
         println!("    incrededup --dataset <name-or-uuid> [--all]              Legacy dataset_ids filter");
-        println!("    incrededup --sqlite <path.db> [--all] [--disk]          SQLite mode");
+        println!("    incrededup --sqlite <path.db> [--all]                   SQLite mode");
         println!("    incrededup --from-index <lsh.redb> --output-dir <dir>   Index-only mode");
         println!("    incrededup --daemon [--interval <secs>]                 Daemon mode");
         println!("    incrededup --sync <dataset_dir>                         Sync matches to DB");
@@ -764,19 +762,37 @@ async fn main() -> Result<()> {
                         dataset_name, dataset_id, unprocessed_count
                     );
 
-                    let db_config = DbConfig::from_env()?
-                        .with_dataset_name(*dataset_id, dataset_name)
-                        .with_table(&args.table);
-
-                    let Some(dataset_lock) =
-                        DbPool::try_acquire_dataset_lock(&db_config, *dataset_id).await?
-                    else {
-                        info!(
-                            "Skipping {} ({}) because another worker holds the dataset lock",
-                            dataset_name, dataset_id
-                        );
-                        continue;
+                    let db_config = match DbConfig::from_env() {
+                        Ok(config) => config
+                            .with_dataset_name(*dataset_id, dataset_name)
+                            .with_table(&args.table),
+                        Err(e) => {
+                            warn!(
+                                "Failed to read database config for {}; skipping this poll: {:#}",
+                                dataset_name, e
+                            );
+                            continue;
+                        }
                     };
+
+                    let dataset_lock =
+                        match DbPool::try_acquire_dataset_lock(&db_config, *dataset_id).await {
+                            Ok(Some(lock)) => lock,
+                            Ok(None) => {
+                                info!(
+                                "Skipping {} ({}) because another worker holds the dataset lock",
+                                dataset_name, dataset_id
+                            );
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                "Failed to acquire dataset lock for {}; skipping this poll: {:#}",
+                                dataset_name, e
+                            );
+                                continue;
+                            }
+                        };
 
                     let dedupe_config = DedupeConfig {
                         threshold: args.threshold,
@@ -1000,7 +1016,7 @@ async fn main() -> Result<()> {
         info!("  Data dir: {:?}", dedupe_config.data_dir);
         info!("  Edge lookup: {:?}", dedupe_config.edge_lookup_mode);
         info!(
-            "  Min content length: {} chars",
+            "  Min content length: {} UTF-8 bytes",
             dedupe_config.min_content_length
         );
         info!("  Phase 2: DISK-BASED");
@@ -1067,7 +1083,7 @@ async fn main() -> Result<()> {
         info!("  Data dir: {:?}", dedupe_config.data_dir);
         info!("  Edge lookup: {:?}", dedupe_config.edge_lookup_mode);
         info!(
-            "  Min content length: {} chars",
+            "  Min content length: {} UTF-8 bytes",
             dedupe_config.min_content_length
         );
         info!("  LSH mode: disk-backed (streaming)");
