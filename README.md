@@ -20,13 +20,19 @@ about 50 million records, with `redb` sidecar indexes totaling about 0.9 TB on
 disk. In this setup, the database is the source of truth and the `incrededup` sidecars hold the LSH
 index, raw duplicate edges, and resumable processing state. Attempting to run this scale of workflow would otherwise require either a highly expensive cluster with a lot of memory or repeated batch rebuilds as new documents keep arriving.
 
-`incrededup` ships as a CLI rather than library, because it keeps its own sidecar index and it seemed simpler to address it as a self-contained system. It supports PostgreSQL, SQLite, text files, and custom stores via the `DocumentSource` trait.
+`incrededup` ships as a CLI rather than library, because it keeps its own sidecar index and it seemed simpler to address it as a self-contained system. It supports PostgreSQL, SQLite, text files, and custom stores via the `DocumentSource` trait. In a sense, it can be thought of as a `rensa` wrapper (the RMinHash implementation is exactly from there).
 
 This software is provided as-is, without any warranty or guarantee of any kind. All code was produced by a rotating cast of agents over ~six months. It has a lot of tests, and it reliably runs daily on real workloads, but there may be bugs and unexpected behaviors. The rest of this readme was produced by LLMs.
 
 ## Quick start
 
-Build the binary:
+Install from crates.io after the first published release:
+
+```bash
+cargo install incrededup --locked
+```
+
+Or build the binary from source:
 
 ```bash
 cargo build --release
