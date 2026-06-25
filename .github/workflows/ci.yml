@@ -39,8 +39,8 @@ jobs:
 
       - name: CLI docs are generated
         run: |
-          python3 scripts/generate_cli_docs.py
-          git diff --exit-code docs/cli.md
+          cargo run --example generate_cli_docs
+          git diff --exit-code README.md docs/cli.md
 
       - name: Test
         run: cargo test --all-targets

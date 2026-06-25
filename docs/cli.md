@@ -1,13 +1,17 @@
 # CLI reference
 
-This file is generated from the current CLI help output. Do not edit it by
-hand. Regenerate it with:
+This file is generated from the current Clap definition in `src/cli.rs`. Do
+not edit it by hand. Regenerate it with:
 
 ```bash
-uv run --script scripts/generate_cli_docs.py
+cargo run --example generate_cli_docs
 ```
 
 Version: `incrededup 0.2.4`
+
+The option order follows the declaration order in `src/cli.rs`: input and mode
+selection first, then matching parameters, state/write controls, daemon
+controls, and sidecar maintenance.
 
 ## Primary contract
 

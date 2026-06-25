@@ -20,75 +20,106 @@ about 50 million records, with `redb` sidecar indexes totaling about 0.9 TB on
 disk. In this setup, the database is the source of truth and the `incrededup` sidecars hold the LSH
 index, raw duplicate edges, and resumable processing state. Attempting to run this scale of workflow would otherwise require either a highly expensive cluster with a lot of memory or repeated batch rebuilds as new documents keep arriving.
 
-`incrededup` ships as a CLI rather than library, because it keeps its own sidecar index and it seemed simpler to address it as a self-contained system.
+`incrededup` ships as a CLI rather than library, because it keeps its own sidecar index and it seemed simpler to address it as a self-contained system. It supports PostgreSQL, SQLite, text files, and custom stores via the `DocumentSource` trait.
 
 This software is provided as-is, without any warranty or guarantee of any kind. All code was produced by a rotating cast of agents over ~six months. It has a lot of tests, and it reliably runs daily on real workloads, but there may be bugs and unexpected behaviors. The rest of this readme was produced by LLMs.
 
-## Documentation
+## Quick start
 
-Start with the full CLI reference: [`docs/cli.md`](docs/cli.md).
-
-Other public docs:
-
-1. [`docs/CUSTOM_SOURCES.md`](docs/CUSTOM_SOURCES.md) explains source schemas
-   and custom `DocumentSource` implementations.
-2. [`docs/architecture.md`](docs/architecture.md) explains the internal
-   pipeline and sidecar layout.
-
-## What it supports
-
-| Source | Interface | Writes results |
-|---|---|---|
-| PostgreSQL | CLI and `PostgresSource` | yes |
-| SQLite | CLI and `SqliteSource` | yes |
-| Text files | `FileSystemSource` | optional JSON report |
-| Custom stores | `DocumentSource` trait | optional |
-
-The filesystem source reads text-like files. It does not parse PDFs, Word
-documents, HTML, images, or archives. Extract text with your own pipeline, then
-pass the resulting strings, SQLite rows, PostgreSQL rows, or text files to
-`incrededup`.
-
-## Quick start: SQLite
-
-This example can be run end-to-end. You can inspect the temporary database to
-see what is being deduplicated and how.
+Build the binary:
 
 ```bash
 cargo build --release
+```
 
-python3 scripts/generate_fake_sqlite.py /tmp/incrededup-demo.sqlite
+Run the included SQLite demo:
 
+```bash
+cargo run --example sqlite_demo
+```
+
+Expected output includes:
+
+```text
+Total documents in SQLite: 200
+Duplicates found: 375
+Unprocessed documents: 0
+Deduplication working correctly.
+```
+
+Run against your own SQLite database:
+
+```bash
 ./target/release/incrededup \
   --sqlite /tmp/incrededup-demo.sqlite \
   --data-dir /tmp/incrededup-index \
   --min-content-len 100
-
-sqlite3 /tmp/incrededup-demo.sqlite \
-  "SELECT child_id, parent_id, jaccard_similarity FROM dupes LIMIT 10;"
 ```
 
-The SQLite source expects a `documents` table with UUID text IDs, document
-content, content length, optional filename, and nullable `is_parent` state. See
-`docs/CUSTOM_SOURCES.md` for the exact schema and custom-source options.
+Expected output is phase-oriented:
 
-## Quick start: PostgreSQL
+```text
+=== Phase 1: Incremental LSH Index Build ===
+=== Phase 2: Finding Duplicates (DISK-BASED parallel) ===
+=== Phase 3: Syncing to Data Source ===
+```
 
-You need a running PostgreSQL database for this example.
+Run against PostgreSQL:
 
 ```bash
 export DATABASE_URL='postgresql://user:password@localhost:5432/documents'
 
-./target/release/incrededup --postgres --data-dir /var/lib/incrededup
-
 ./target/release/incrededup \
   --postgres \
-  --daemon \
-  --data-dir /var/lib/incrededup \
-  --interval 60
+  --data-dir /var/lib/incrededup
 ```
 
-PostgreSQL mode expects:
+Expected output includes the table/scope, sidecar directory, document count,
+and the same three pipeline phases.
+
+Run against one logical corpus inside a shared PostgreSQL table:
+
+```bash
+./target/release/incrededup \
+  --postgres \
+  --scope court_opinions \
+  --scope-where "corpus = 'court_opinions'" \
+  --data-dir /var/lib/incrededup
+```
+
+Expected sidecars:
+
+```text
+/var/lib/incrededup/court_opinions/lsh.redb
+/var/lib/incrededup/court_opinions/matches.redb
+/var/lib/incrededup/court_opinions/state.redb
+```
+
+Inspect an existing sidecar directory:
+
+```bash
+./target/release/incrededup \
+  --inspect /var/lib/incrededup/court_opinions \
+  --inspect-sample
+```
+
+Build the adjacency side-index for large incremental stores:
+
+```bash
+./target/release/incrededup \
+  --build-adjacency /var/lib/incrededup/court_opinions
+```
+
+Then validate and use it in daemon mode:
+
+```bash
+./target/release/incrededup --daemon --postgres --edge-lookup shadow
+./target/release/incrededup --daemon --postgres --edge-lookup auto
+```
+
+## PostgreSQL schema
+
+The default PostgreSQL schema is:
 
 ```sql
 CREATE TABLE documents (
@@ -112,151 +143,253 @@ Unprocessed documents have `is_parent IS NULL`. After a run, duplicate children
 have `is_parent = false`; unique documents and canonical roots have
 `is_parent = true`.
 
-If one table carries several logical corpora, define a named scope:
+For SQLite schemas and custom stores, see
+[`docs/custom-sources.md`](docs/custom-sources.md).
+
+## Documentation
+
+Start with the full CLI reference below or in [`docs/cli.md`](docs/cli.md).
+
+1. [`docs/cli.md`](docs/cli.md) is the generated CLI reference.
+2. [`docs/architecture.md`](docs/architecture.md) is the high-level project
+   map for maintainers and LLM agents.
+3. [`docs/custom-sources.md`](docs/custom-sources.md) covers source schemas
+   and custom `DocumentSource` implementations.
+4. [`docs/comparison.md`](docs/comparison.md) covers matching behavior and
+   related software.
+5. [`docs/operations.md`](docs/operations.md) covers sidecars and adjacency
+   maintenance.
+6. [`docs/development.md`](docs/development.md) covers local development
+   checks.
+
+<!-- BEGIN GENERATED CLI REFERENCE -->
+## CLI reference
+
+The same generated reference is also available at [`docs/cli.md`](docs/cli.md).
+
+This section is generated from the current Clap definition in `src/cli.rs`. Do
+not edit it by hand. Regenerate it with:
 
 ```bash
-./target/release/incrededup \
-  --postgres \
-  --scope court_opinions \
-  --scope-where "corpus = 'court_opinions'"
+cargo run --example generate_cli_docs
 ```
 
-The scope name is used for the sidecar directory. `--scope-where` is trusted SQL
-added to the PostgreSQL `WHERE` clause, so it can match your existing schema:
-`corpus = 'x'`, `source_id = '...'`, `project_ids ? '...'`, and so on.
+Version: `incrededup 0.2.4`
 
-`--dataset <name-or-uuid>` remains as a legacy shortcut for the original
-incrededup deployment. It expects a `datasets` table and a `dataset_ids JSONB`
-array on `documents`.
+The option order follows the declaration order in `src/cli.rs`: input and mode
+selection first, then matching parameters, state/write controls, daemon
+controls, and sidecar maintenance.
 
-## Quick start: text files
-
-```bash
-cargo run --example text_files_demo
-```
-
-The example creates a temporary directory of `.txt` files, runs deduplication
-through `FileSystemSource`, writes the same `redb` sidecars as the other
-sources, and emits a JSON duplicate report. In production, file-heavy pipelines
-usually extract text first and then either load it into PostgreSQL or SQLite for
-the CLI, or call `FileSystemSource`/`DocumentSource` from a small Rust wrapper.
-
-## Comparator contract
-
-Duplicate detection is based on text similarity after a small, fixed
-normalization step:
-
-1. Content is split with Rust `split_whitespace()`.
-2. Tokens with length 1 are ignored.
-3. If at least three tokens remain, signatures are built from 3-word shingles.
-   If fewer than three remain, the remaining tokens are used directly.
-4. MinHash uses 128 permutations and the configured seed.
-5. LSH uses 16 bands with 8 rows per band.
-6. Candidate pairs are rejected when `abs(len_a - len_b) / max(len_a, len_b)`
-   is greater than `--size-diff`. The default is `0.3`.
-7. Candidate pairs are duplicates when signature Jaccard similarity is at least
-   `--threshold`. The default is `0.8`.
-8. The larger document is stored as the child. Ties use the document currently
-   being processed as the child. Transitive sync later chooses the
-   lexicographically smallest UUID in a component as the canonical parent.
-
-The stored `jaccard_similarity` is the fraction of equal MinHash values across
-the two signatures, not exact set Jaccard over source tokens.
-
-## Comparison software
-
-Most near-duplicate text tools use MinHash and LSH. The practical difference is
-whether the index can live outside RAM, whether raw duplicate pairs are saved
-for later transitive resolution, and whether new rows can be deduplicated
-against an existing corpus without rebuilding everything.
-
-Legend: ✓ yes, ◐ partial or requires surrounding application code, – no.
-
-| Software | MinHash/LSH | Index outside RAM | Saves duplicate pairs | Adds new rows without rebuild | Writes DB results |
-|---|---:|---:|---:|---:|---:|
-| incrededup | ✓ | ✓ | ✓ | ✓ | ✓ |
-| [Duplodocus](https://github.com/allenai/duplodocus) | ✓ | ✓ | ✓ | – | – |
-| [DataTrove](https://github.com/huggingface/datatrove) | ✓ | ✓ | ✓ | ◐ | – |
-| [text-dedup](https://github.com/ChenghaoMou/text-dedup) | ✓ | – | – | – | – |
-| [datasketch](https://github.com/ekzhu/datasketch) | ✓ | ◐ | – | ◐ | – |
-| [Rensa](https://github.com/beowolx/rensa) | ✓ | – | – | – | – |
-
-`Index outside RAM` means the tool has a built-in disk, remote-file, or external
-backend path for the MinHash/LSH index. `Saves duplicate pairs` means it writes
-raw pairwise duplicate edges, even if only as batch intermediate files. `Adds
-new rows without rebuild` means new documents can arrive after the first run and
-be compared against existing corpus state without rebuilding the whole corpus.
-
-Duplodocus and DataTrove are the closest batch comparators. `datasketch` and
-Rensa are useful building blocks, but the corpus pipeline is yours. `text-dedup`
-is convenient for dataset cleanup, but its MinHash path is not shaped as a
-disk-backed database service.
-
-Duplodocus is disk-backed, but batch-oriented: adding files means running the
-corpus-level file-map, signature, edge, union-find, and clean stages again, not
-appending to a live index.
-
-This does not mean every operation has tiny peak memory. A genuinely large
-duplicate component still has to be resolved in Phase 3, and that connected edge
-set can be several GB. The design goal is narrower: do not require the full
-MinHash/LSH index or full historical match graph to fit in RAM just to keep
-deduplicating a growing corpus.
-
-## Operating modes
-
-See [`docs/cli.md`](docs/cli.md) for the complete CLI contract, including all
-modes, flags, environment variables, sidecar paths, and write behavior.
-
-## Sidecar files
-
-Each source gets a directory under `--data-dir`:
+## Primary contract
 
 ```text
-lsh.redb               MinHash signatures and LSH buckets
-matches.redb           raw duplicate edges and optional adjacency side-index
-state.redb             resumable phase state
-filtered_parents.redb  short or boilerplate docs when source writes are skipped
+Performant, disk-based, incremental deduplication using MinHash LSH
+
+Usage: incrededup [OPTIONS]
+
+Options:
+      --postgres
+          Process a PostgreSQL table using DATABASE_URL.
+          
+          By default this processes the whole table. Use --scope/--scope-where when one physical table contains multiple logical corpora.
+
+      --scope <SCOPE>
+          Name for a logical subset of the PostgreSQL table.
+          
+          Requires --scope-where. The name is used for the sidecar directory.
+
+      --scope-where <SCOPE_WHERE>
+          Trusted SQL predicate for --scope, for example: corpus = 'news'.
+          
+          The predicate is appended to read/update queries as an additional WHERE condition. It should select a stable logical corpus.
+
+  -d, --dataset <DATASET>
+          Legacy dataset UUID or name to process (requires a datasets table and dataset_ids JSONB)
+
+      --from-index <FROM_INDEX>
+          Run deduplication from an existing LSH index.
+          
+          Point to an lsh.redb file or its containing sidecar directory.
+
+      --output-dir <OUTPUT_DIR>
+          Output directory for --from-index mode (default: same dir as index)
+
+  -t, --threshold <THRESHOLD>
+          Jaccard similarity threshold (0.0 - 1.0)
+          
+          [default: 0.8]
+
+      --size-diff <SIZE_DIFF>
+          Maximum size difference ratio to consider pairs
+          
+          [default: 0.3]
+
+  -b, --batch-size <BATCH_SIZE>
+          Database fetch batch size
+          
+          [default: 10000]
+
+      --disk-lsh <DISK_LSH>
+          Deprecated and ignored. Sidecars live under --data-dir/<source>/
+
+      --seed <SEED>
+          MinHash seed for reproducibility
+          
+          [default: 42]
+
+      --table <TABLE>
+          Database table name
+          
+          [default: documents]
+
+  -w, --workers <WORKERS>
+          Number of worker threads (default: number of CPUs)
+
+      --dry-run
+          Dry-run supported modes.
+          
+          PostgreSQL one-shot modes count documents only. --sync, including the auto-sync step after --from-index, resolves planned writes without writing. Other modes ignore this flag.
+
+  -v, --verbose
+          Verbose output
+
+      --all
+          Process all documents and rebuild local sidecars from scratch
+
+      --data-dir <DATA_DIR>
+          Base directory for data files (LSH index, matches, state)
+          
+          [default: ./data]
+
+      --skip-db-write
+          Skip writing duplicate results and is_parent updates to the source
+
+      --memory
+          Deprecated. Phase 2 always uses the disk-backed implementation
+
+      --fresh
+          Start fresh by clearing local sidecars before processing
+
+      --no-sync
+          Skip database sync after --from-index completes (by default, syncs to DB)
+
+      --daemon
+          Run in daemon mode - continuously poll for unprocessed documents.
+          
+          With --postgres, polls the configured table. With --sqlite, polls that SQLite database. Without either, uses the legacy multi-dataset PostgreSQL schema.
+
+      --run-once
+          Exit after one daemon pass instead of looping.
+          
+          Useful with cron and flock. Requires --daemon.
+
+      --interval <INTERVAL>
+          Polling interval in seconds for daemon mode (default: 5)
+          
+          [default: 5]
+
+      --log-file <LOG_FILE>
+          Log file path (for daemon mode). Logs to stdout if not specified
+
+      --min-content-len <MIN_CONTENT_LEN>
+          Minimum content length to index.
+          
+          Shorter documents are skipped and marked as parents.
+          
+          [default: 500]
+
+      --edge-lookup <EDGE_LOOKUP>
+          Connected-edge lookup mode for Phase 3: scan, auto, or shadow
+
+          Possible values:
+          - scan:   Existing behavior: scan matches.redb for connected edges
+          - auto:   Use the adjacency side-index once it has been fully backfilled
+          - shadow: Compare adjacency output against scan output, but return scan output
+          
+          [default: scan]
+
+      --sync <SYNC>
+          Sync matches to PostgreSQL with transitivity resolution.
+          
+          Point to a sidecar directory containing matches.redb.
+
+      --inspect <INSPECT>
+          Inspect matches.redb file contents.
+          
+          Point to a sidecar directory containing matches.redb.
+
+      --build-adjacency <BUILD_ADJACENCY>
+          Build the adjacency side-index for a source directory or matches.redb file
+
+      --inspect-limit <INSPECT_LIMIT>
+          Limit for --inspect mode (number of sample matches to show)
+          
+          [default: 20]
+
+      --inspect-sample
+          Show detailed samples in --inspect mode
+
+      --sqlite <SQLITE>
+          Use a SQLite database instead of PostgreSQL.
+          
+          Point to a .sqlite or .db file containing a documents table.
+
+      --cleanup <CLEANUP>
+          Detect and optionally handle pathological clusters.
+          
+          Point to a sidecar directory containing lsh.redb. Use --cleanup-action to choose report, mark-parent, or delete.
+
+      --cleanup-action <CLEANUP_ACTION>
+          Action to take in cleanup mode: report (dry-run), mark-parent, delete
+          
+          [default: report]
+
+      --cleanup-min-bucket <CLEANUP_MIN_BUCKET>
+          Minimum bucket size to consider pathological (default: 10000)
+          
+          [default: 10000]
+
+      --cleanup-min-bands <CLEANUP_MIN_BANDS>
+          Minimum number of LSH bands to consider pathological (default: 14 of 16)
+          
+          [default: 14]
+
+      --keep-in-memory
+          Keep index memory resident in daemon mode.
+          
+          By default, daemon releases memory after --memory-idle-timeout minutes of no activity.
+
+      --memory-idle-timeout <MEMORY_IDLE_TIMEOUT>
+          Minutes of idle time before releasing memory back to the OS.
+          
+          Set to 0 to release immediately after each batch. Ignored if --keep-in-memory is set
+          
+          [default: 60]
+
+      --search-index-error-backoff-secs <SEARCH_INDEX_ERROR_BACKOFF_SECS>
+          Seconds to back off a dataset after pg_search/Tantivy index corruption is detected
+          
+          [default: 600]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
-`matches.redb` stores real duplicate edges keyed by `(child_id, parent_id)`.
-Unique documents are not written as self-parent edges; sync marks current-batch
-documents with no child assignment as parents.
+## Runtime notes
 
-## Adjacency side-index
-
-Large historical match stores can make incremental sync spend most of its time
-scanning `matches.redb` for edges connected to the current batch. Build the
-side-index once, then switch daemon runs to `auto`:
-
-```bash
-./target/release/incrededup --build-adjacency /var/lib/incrededup/my_dataset
-./target/release/incrededup --daemon --edge-lookup shadow
-./target/release/incrededup --daemon --edge-lookup auto
-```
-
-Stop writers while `--build-adjacency` runs so `matches.redb` is stable. The
-builder is resumable and marks the index usable only after a full backfill
-completes.
-
-## Development checks
-
-```bash
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
-cargo test --doc
-cargo run --example sqlite_demo
-cargo run --example text_files_demo
-cargo publish --dry-run --allow-dirty
-```
-
-The Postgres integration tests use a local Unix socket when available. In CI,
-set `POSTGRES_TEST_URL`, for example:
-
-```bash
-POSTGRES_TEST_URL='postgresql://postgres:postgres@localhost:5432/postgres' \
-  cargo test --test postgres_integration_tests
-```
+1. PostgreSQL modes read `DATABASE_URL`.
+2. SQLite modes take the database path from `--sqlite`.
+3. Standalone `--sync` writes to PostgreSQL and reads `DATABASE_URL`.
+4. `--cleanup report` only reads sidecars. `--cleanup mark-parent` and
+   `--cleanup delete` write to PostgreSQL and read `DATABASE_URL`.
+5. `--sync` uses `SYNC_WORKERS` for parent and child marking. Default: `8`.
+6. Sidecars live under `<data-dir>/<source-name>/`.
+7. `--inspect`, `--build-adjacency`, and `--cleanup report` do not require a
+   database connection.
+<!-- END GENERATED CLI REFERENCE -->
 
 ## License
 

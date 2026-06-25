@@ -27,6 +27,7 @@
 //! ```
 
 pub mod cleanup;
+pub mod cli;
 pub mod db;
 pub mod dedupe;
 pub mod disk_dedupe;
@@ -49,6 +50,7 @@ pub use cleanup::{
     find_pathological_clusters, run_cleanup, run_phase_1_5, CleanupAction, CleanupStats,
     PathologicalCluster,
 };
+pub use cli::{Args, EdgeLookupArg};
 pub use disk_dedupe::{run_disk_dedupe, DiskDedupeStats, DiskDeduplicator};
 pub use lsh::{DiskLSH, InMemoryLSH};
 pub use minhash::{

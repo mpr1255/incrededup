@@ -2,7 +2,7 @@
 
 This is a map for future maintainers and LLM agents. It is not the CLI
 reference. Use `docs/cli.md` for the generated command-line contract and
-`docs/CUSTOM_SOURCES.md` for source schemas.
+`docs/custom-sources.md` for source schemas.
 
 ## What it is
 
