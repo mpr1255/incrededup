@@ -1,4 +1,4 @@
-# Custom sources
+# custom sources
 
 `incrededup` reads documents through the `DocumentSource` trait. The built-in
 sources cover PostgreSQL, SQLite, and plain text-like files on disk.
