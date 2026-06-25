@@ -24,6 +24,17 @@ index, raw duplicate edges, and resumable processing state. Attempting to run th
 
 This software is provided as-is, without any warranty or guarantee of any kind. All code was produced by a rotating cast of agents over ~six months. It has a lot of tests, and it reliably runs daily on real workloads, but there may be bugs and unexpected behaviors. The rest of this readme was produced by LLMs.
 
+## Documentation
+
+Start with the full CLI reference: [`docs/cli.md`](docs/cli.md).
+
+Other public docs:
+
+1. [`docs/CUSTOM_SOURCES.md`](docs/CUSTOM_SOURCES.md) explains source schemas
+   and custom `DocumentSource` implementations.
+2. [`docs/architecture.md`](docs/architecture.md) explains the internal
+   pipeline and sidecar layout.
+
 ## What it supports
 
 | Source | Interface | Writes results |
@@ -193,27 +204,8 @@ deduplicating a growing corpus.
 
 ## Operating modes
 
-```bash
-incrededup --postgres
-incrededup --postgres --scope NAME --scope-where SQL
-incrededup --dataset NAME
-incrededup --sqlite PATH
-incrededup --daemon
-incrededup --inspect DATASET_DIR --inspect-sample
-incrededup --sync DATASET_DIR
-incrededup --build-adjacency DATASET_DIR
-```
-
-Useful flags:
-
-```bash
---all                 process all documents, not only unprocessed rows
---fresh               clear local sidecars before processing
---threshold 0.8       duplicate threshold
---size-diff 0.3       maximum allowed size difference ratio
---min-content-len 500 skip shorter documents and mark them as parents
---edge-lookup auto    use the adjacency side-index after backfill
-```
+See [`docs/cli.md`](docs/cli.md) for the complete CLI contract, including all
+modes, flags, environment variables, sidecar paths, and write behavior.
 
 ## Sidecar files
 

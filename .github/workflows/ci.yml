@@ -37,6 +37,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: CLI docs are generated
+        run: |
+          python3 scripts/generate_cli_docs.py
+          git diff --exit-code docs/cli.md
+
       - name: Test
         run: cargo test --all-targets
 

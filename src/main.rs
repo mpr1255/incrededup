@@ -162,8 +162,9 @@ struct Args {
     #[arg(short, long)]
     dataset: Option<String>,
 
-    /// Run deduplication from existing LSH index (no database required)
-    /// Point to an lsh.redb file created by a previous run
+    /// Run deduplication from an existing LSH index.
+    ///
+    /// Point to an lsh.redb file or its containing sidecar directory.
     #[arg(long)]
     from_index: Option<PathBuf>,
 
@@ -183,7 +184,7 @@ struct Args {
     #[arg(short, long, default_value = "10000")]
     batch_size: i64,
 
-    /// Path for disk-backed LSH (if not specified, uses in-memory)
+    /// Deprecated and ignored. Sidecars live under --data-dir/<source>/.
     #[arg(long)]
     disk_lsh: Option<String>,
 
@@ -199,7 +200,11 @@ struct Args {
     #[arg(short, long)]
     workers: Option<usize>,
 
-    /// Dry run - just count documents, don't process
+    /// Dry-run supported modes.
+    ///
+    /// PostgreSQL one-shot modes count documents only. --sync, including the
+    /// auto-sync step after --from-index, resolves planned writes without
+    /// writing. Other modes ignore this flag.
     #[arg(long)]
     dry_run: bool,
 
@@ -215,7 +220,7 @@ struct Args {
     #[arg(long, default_value = "./data")]
     data_dir: String,
 
-    /// Skip writing results to PostgreSQL (for testing/validation)
+    /// Skip writing duplicate results and is_parent updates to the source.
     #[arg(long)]
     skip_db_write: bool,
 
@@ -223,7 +228,7 @@ struct Args {
     #[arg(long)]
     memory: bool,
 
-    /// Start fresh - ignore existing state and matches (for --from-index mode)
+    /// Start fresh by clearing local sidecars before processing.
     #[arg(long)]
     fresh: bool,
 
@@ -233,13 +238,15 @@ struct Args {
 
     /// Run in daemon mode - continuously poll for unprocessed documents.
     ///
-    /// With --postgres, polls the configured table. Without --postgres, the
-    /// PostgreSQL daemon uses the legacy multi-dataset schema.
+    /// With --postgres, polls the configured table. With --sqlite, polls that
+    /// SQLite database. Without either, uses the legacy multi-dataset
+    /// PostgreSQL schema.
     #[arg(long)]
     daemon: bool,
 
-    /// Exit after one pass instead of looping (for use with cron + flock)
-    /// Requires --daemon. Processes all datasets once then exits.
+    /// Exit after one daemon pass instead of looping.
+    ///
+    /// Useful with cron and flock. Requires --daemon.
     #[arg(long)]
     run_once: bool,
 
@@ -251,8 +258,9 @@ struct Args {
     #[arg(long)]
     log_file: Option<PathBuf>,
 
-    /// Minimum content length to index (shorter documents are skipped and marked as parents)
-    /// Default: 500 chars (matches Python version)
+    /// Minimum content length to index.
+    ///
+    /// Shorter documents are skipped and marked as parents.
     #[arg(long, default_value = "500")]
     min_content_len: i32,
 
@@ -260,13 +268,15 @@ struct Args {
     #[arg(long, value_enum, default_value = "scan")]
     edge_lookup: EdgeLookupArg,
 
-    /// Sync matches to PostgreSQL (with transitivity resolution)
-    /// Point to a source directory containing matches.redb
+    /// Sync matches to PostgreSQL with transitivity resolution.
+    ///
+    /// Point to a sidecar directory containing matches.redb.
     #[arg(long)]
     sync: Option<PathBuf>,
 
-    /// Inspect matches.redb file contents
-    /// Point to a source directory containing matches.redb
+    /// Inspect matches.redb file contents.
+    ///
+    /// Point to a sidecar directory containing matches.redb.
     #[arg(long)]
     inspect: Option<PathBuf>,
 
@@ -282,14 +292,16 @@ struct Args {
     #[arg(long)]
     inspect_sample: bool,
 
-    /// Use SQLite database instead of PostgreSQL
-    /// Point to a .sqlite or .db file containing documents table
+    /// Use a SQLite database instead of PostgreSQL.
+    ///
+    /// Point to a .sqlite or .db file containing a documents table.
     #[arg(long)]
     sqlite: Option<PathBuf>,
 
-    /// Cleanup mode: detect and handle pathological clusters
-    /// Point to a source directory containing lsh.redb
-    /// Use --cleanup-action to specify what to do (default: report)
+    /// Detect and optionally handle pathological clusters.
+    ///
+    /// Point to a sidecar directory containing lsh.redb. Use --cleanup-action
+    /// to choose report, mark-parent, or delete.
     #[arg(long)]
     cleanup: Option<PathBuf>,
 
@@ -305,13 +317,16 @@ struct Args {
     #[arg(long, default_value = "14")]
     cleanup_min_bands: usize,
 
-    /// Keep index cached in memory forever (never release)
-    /// By default, daemon releases memory after --memory-idle-timeout minutes of no activity
+    /// Keep index memory resident in daemon mode.
+    ///
+    /// By default, daemon releases memory after --memory-idle-timeout minutes
+    /// of no activity.
     #[arg(long)]
     keep_in_memory: bool,
 
-    /// Minutes of idle time before releasing memory back to OS (default: 60)
-    /// Set to 0 to release immediately after each batch
+    /// Minutes of idle time before releasing memory back to the OS.
+    ///
+    /// Set to 0 to release immediately after each batch.
     /// Ignored if --keep-in-memory is set
     #[arg(long, default_value = "60")]
     memory_idle_timeout: u64,
