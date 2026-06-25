@@ -1,5 +1,11 @@
 //! LSH (Locality-Sensitive Hashing) implementation with disk-backed storage.
 //!
+//! The in-memory banding and candidate lookup are adapted from Rensa's
+//! `RMinHashLSH` design (https://github.com/beowolx/rensa). Copyright (c) 2024
+//! beowulf; incorporated under the MIT License and modified for `incrededup`.
+//! See THIRD_PARTY_NOTICES.md. The `redb` sidecar storage layer is
+//! `incrededup`-specific.
+//!
 //! This module provides both in-memory and disk-backed LSH indices using redb.
 //! The disk-backed version allows processing datasets larger than memory.
 

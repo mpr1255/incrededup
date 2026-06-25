@@ -1,4 +1,7 @@
-//! Hash utility functions extracted from Rensa (https://github.com/beowolx/rensa)
+//! Hash utility functions derived from Rensa (https://github.com/beowolx/rensa).
+//!
+//! Copyright (c) 2024 beowulf. Incorporated under the MIT License and modified
+//! for `incrededup`; see THIRD_PARTY_NOTICES.md.
 
 use rustc_hash::FxHasher;
 use std::hash::Hasher;

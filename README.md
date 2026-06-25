@@ -393,11 +393,22 @@ Options:
 
 ## License
 
-Licensed under `MIT OR Apache-2.0`. See the canonical SPDX entries for
-[`MIT`](https://spdx.org/licenses/MIT.html) and
-[`Apache-2.0`](https://spdx.org/licenses/Apache-2.0.html).
+`incrededup` is licensed under either the MIT License or the Apache License,
+Version 2.0, at your option. See [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE).
+
+Portions of the MinHash and in-memory LSH implementation are derived from
+[Rensa](https://github.com/beowolx/rensa), copyright (c) 2024 beowulf, and
+were incorporated under the MIT License. The required upstream copyright and
+license notice is reproduced in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and remains applicable
+regardless of which `incrededup` license option is selected.
 
 ## Acknowledgments
 
-The MinHash and LSH implementation started from ideas in
-`https://github.com/beowolx/rensa`.
+The core R-MinHash implementation is derived from
+[Rensa](https://github.com/beowolx/rensa). `incrededup` should be understood as
+packaging that Rensa-derived algorithm inside a disk-backed CLI system: it adds
+the `redb` sidecars, persistent incremental state, PostgreSQL/SQLite/text-file
+source adapters, duplicate-edge storage, transitive sync, daemon mode, and
+operational tooling around the underlying MinHash/LSH approach.

@@ -1,8 +1,8 @@
 //! incrededup: Performant, disk-based, incremental deduplication using MinHash LSH
 //!
 //! This library provides:
-//! - MinHash signature computation (extracted from Rensa)
-//! - LSH (Locality-Sensitive Hashing) indexing (in-memory and disk-backed)
+//! - Rensa-derived R-MinHash signature computation
+//! - LSH indexing, with Rensa-derived in-memory banding and disk-backed sidecars
 //! - PostgreSQL integration for document fetching and result storage
 //! - Parallel processing with rayon
 //!

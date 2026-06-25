@@ -1,10 +1,11 @@
-//! MinHash implementation extracted from Rensa (https://github.com/beowolx/rensa)
+//! R-MinHash implementation derived from Rensa (https://github.com/beowolx/rensa).
 //!
-//! This is the RMinHash algorithm - a novel MinHash variant designed for
-//! high-performance similarity estimation and deduplication.
+//! Copyright (c) 2024 beowulf. Incorporated under the MIT License and modified
+//! for `incrededup`; see THIRD_PARTY_NOTICES.md.
 //!
-//! Modifications from original:
-//! - Removed PyO3 bindings (pure Rust API)
+//! `incrededup` removes the PyO3/Python surface, exposes Rust-native helpers,
+//! and uses the Rensa-derived signatures inside a disk-backed deduplication
+//! pipeline.
 
 mod hasher;
 
