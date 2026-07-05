@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
@@ -105,6 +106,12 @@ const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 // Key: field name, Value: serialized value
 const SYNC_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sync_state");
 
+fn begin_quick_repair_write(db: &Database) -> Result<redb::WriteTransaction> {
+    let mut write_txn = db.begin_write()?;
+    write_txn.set_quick_repair(true);
+    Ok(write_txn)
+}
+
 /// Sync progress tracking - which step of sync we're on
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStep {
@@ -164,6 +171,17 @@ pub struct AdjacencyBuildStats {
     pub entries_written: u64,
 }
 
+/// Statistics from a connected-edge streaming pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectedEdgeStats {
+    /// Real duplicate edges yielded to the caller.
+    pub edges_streamed: u64,
+    /// Nodes reached while walking from the seed document ids.
+    pub nodes_seen: usize,
+    /// Whether the adjacency side-index served the pass.
+    pub used_adjacency_index: bool,
+}
+
 /// Canonical storage for duplicate matches
 pub struct MatchStore {
     db: Database,
@@ -179,7 +197,7 @@ impl MatchStore {
             .with_context(|| format!("Failed to open matches DB at {:?}", path.as_ref()))?;
 
         // Initialize tables
-        let write_txn = db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&db)?;
         {
             let _ = write_txn.open_table(MATCHES_TABLE)?;
             let _ = write_txn.open_table(ADJACENCY_TABLE)?;
@@ -221,7 +239,7 @@ impl MatchStore {
         }
 
         let mut inserted = 0;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(MATCHES_TABLE)?;
             let mut adjacency = write_txn.open_table(ADJACENCY_TABLE)?;
@@ -334,15 +352,29 @@ impl MatchStore {
     /// daemon incremental sync. The table is scanned until no new endpoints are
     /// discovered; memory remains bounded by the affected components.
     pub fn get_real_edges_connected_to(&self, seed_doc_ids: &[Uuid]) -> Result<Vec<MatchRecord>> {
+        let mut records = Vec::new();
+        self.visit_real_edges_connected_to(seed_doc_ids, |record| {
+            records.push(record.clone());
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    /// Visit real duplicate edges in the connected components touched by
+    /// `seed_doc_ids` without materializing the edge set in memory.
+    pub fn visit_real_edges_connected_to<F>(
+        &self,
+        seed_doc_ids: &[Uuid],
+        mut visitor: F,
+    ) -> Result<ConnectedEdgeStats>
+    where
+        F: FnMut(&MatchRecord) -> Result<()>,
+    {
         if seed_doc_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ConnectedEdgeStats::default());
         }
 
-        let mut known_docs: std::collections::HashSet<Uuid> =
-            seed_doc_ids.iter().copied().collect();
-        let mut included_edges: std::collections::HashSet<(Uuid, Uuid)> =
-            std::collections::HashSet::new();
-        let mut records = Vec::new();
+        let mut known_docs: HashSet<Uuid> = seed_doc_ids.iter().copied().collect();
 
         loop {
             let before = known_docs.len();
@@ -361,10 +393,6 @@ impl MatchStore {
                 if known_docs.contains(&record.child_id) || known_docs.contains(&record.parent_id) {
                     known_docs.insert(record.child_id);
                     known_docs.insert(record.parent_id);
-
-                    if included_edges.insert((record.child_id, record.parent_id)) {
-                        records.push(record);
-                    }
                 }
             }
 
@@ -373,7 +401,28 @@ impl MatchStore {
             }
         }
 
-        Ok(records)
+        let mut edges_streamed = 0;
+        self.full_scans.fetch_add(1, Ordering::Relaxed);
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(MATCHES_TABLE)?;
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let child_id = child_id_from_match_key(key.value())?;
+            let record = self.deserialize_record(&child_id, value.value())?;
+            if record.child_id == record.parent_id {
+                continue;
+            }
+            if known_docs.contains(&record.child_id) || known_docs.contains(&record.parent_id) {
+                visitor(&record)?;
+                edges_streamed += 1;
+            }
+        }
+
+        Ok(ConnectedEdgeStats {
+            edges_streamed,
+            nodes_seen: known_docs.len(),
+            used_adjacency_index: false,
+        })
     }
 
     /// Whether a full adjacency backfill has been recorded as complete. Until it
@@ -389,7 +438,7 @@ impl MatchStore {
     }
 
     fn set_adjacency_built(&self) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(META_TABLE)?;
             let flag = [1u8];
@@ -453,7 +502,7 @@ impl MatchStore {
 
     fn flush_adjacency(&self, entries: &[([u8; 48], [u8; 20])]) -> Result<usize> {
         let mut inserted = 0;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut adjacency = write_txn.open_table(ADJACENCY_TABLE)?;
             for (k, v) in entries {
@@ -479,19 +528,40 @@ impl MatchStore {
         &self,
         seed_doc_ids: &[Uuid],
     ) -> Result<Vec<MatchRecord>> {
+        let mut records = Vec::new();
+        self.visit_real_edges_connected_to_indexed(seed_doc_ids, |record| {
+            records.push(record.clone());
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    /// Visit connected real duplicate edges using the adjacency side-index.
+    ///
+    /// Each stored edge has two adjacency entries, one per endpoint. The walk
+    /// emits the edge only when visiting its lower UUID endpoint, so memory is
+    /// bounded by reached nodes rather than reached edges.
+    pub fn visit_real_edges_connected_to_indexed<F>(
+        &self,
+        seed_doc_ids: &[Uuid],
+        mut visitor: F,
+    ) -> Result<ConnectedEdgeStats>
+    where
+        F: FnMut(&MatchRecord) -> Result<()>,
+    {
         if seed_doc_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ConnectedEdgeStats {
+                used_adjacency_index: true,
+                ..ConnectedEdgeStats::default()
+            });
         }
 
         let read_txn = self.db.begin_read()?;
         let adjacency = read_txn.open_table(ADJACENCY_TABLE)?;
 
-        let mut visited_nodes: std::collections::HashSet<Uuid> =
-            seed_doc_ids.iter().copied().collect();
-        let mut stack: Vec<Uuid> = seed_doc_ids.to_vec();
-        let mut visited_edges: std::collections::HashSet<(Uuid, Uuid)> =
-            std::collections::HashSet::new();
-        let mut records = Vec::new();
+        let mut visited_nodes: HashSet<Uuid> = seed_doc_ids.iter().copied().collect();
+        let mut stack: Vec<Uuid> = visited_nodes.iter().copied().collect();
+        let mut edges_streamed = 0;
 
         while let Some(node) = stack.pop() {
             let node_bytes = node.as_bytes();
@@ -509,16 +579,18 @@ impl MatchStore {
                 let child_id = Uuid::from_slice(&key[16..32])?;
                 let parent_id = Uuid::from_slice(&key[32..48])?;
 
-                if visited_edges.insert((child_id, parent_id)) {
+                if node == child_id.min(parent_id) {
                     let v = value.value();
                     if v.len() >= 20 {
-                        records.push(MatchRecord {
+                        let record = MatchRecord {
                             child_id,
                             parent_id,
                             jaccard_similarity: f64::from_le_bytes(v[0..8].try_into()?),
                             size_difference: i32::from_le_bytes(v[8..12].try_into()?),
                             size_difference_pct: f64::from_le_bytes(v[12..20].try_into()?),
-                        });
+                        };
+                        visitor(&record)?;
+                        edges_streamed += 1;
                     }
                 }
 
@@ -533,7 +605,11 @@ impl MatchStore {
             }
         }
 
-        Ok(records)
+        Ok(ConnectedEdgeStats {
+            edges_streamed,
+            nodes_seen: visited_nodes.len(),
+            used_adjacency_index: true,
+        })
     }
 
     /// Load connected edges via the adjacency index when it has been built,
@@ -543,13 +619,28 @@ impl MatchStore {
         &self,
         seed_doc_ids: &[Uuid],
     ) -> Result<(Vec<MatchRecord>, bool)> {
+        let mut records = Vec::new();
+        let stats = self.visit_real_edges_connected_to_auto(seed_doc_ids, |record| {
+            records.push(record.clone());
+            Ok(())
+        })?;
+        Ok((records, stats.used_adjacency_index))
+    }
+
+    /// Visit connected edges via the adjacency index when it has been built,
+    /// otherwise fall back to the full-scan implementation.
+    pub fn visit_real_edges_connected_to_auto<F>(
+        &self,
+        seed_doc_ids: &[Uuid],
+        visitor: F,
+    ) -> Result<ConnectedEdgeStats>
+    where
+        F: FnMut(&MatchRecord) -> Result<()>,
+    {
         if self.is_adjacency_built()? {
-            Ok((
-                self.get_real_edges_connected_to_indexed(seed_doc_ids)?,
-                true,
-            ))
+            self.visit_real_edges_connected_to_indexed(seed_doc_ids, visitor)
         } else {
-            Ok((self.get_real_edges_connected_to(seed_doc_ids)?, false))
+            self.visit_real_edges_connected_to(seed_doc_ids, visitor)
         }
     }
 
@@ -611,7 +702,7 @@ impl FilteredParentStore {
         let db = Database::create(path.as_ref())
             .with_context(|| format!("Failed to open filtered parent DB at {:?}", path.as_ref()))?;
 
-        let write_txn = db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&db)?;
         {
             let _ = write_txn.open_table(FILTERED_PARENTS_TABLE)?;
         }
@@ -625,7 +716,7 @@ impl FilteredParentStore {
             return Ok(0);
         }
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         let mut inserted = 0usize;
         {
             let mut table = write_txn.open_table(FILTERED_PARENTS_TABLE)?;
@@ -672,7 +763,7 @@ impl StateStore {
             .with_context(|| format!("Failed to open state DB at {:?}", path.as_ref()))?;
 
         // Initialize tables
-        let write_txn = db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&db)?;
         {
             let _ = write_txn.open_table(META_TABLE)?;
             let _ = write_txn.open_table(SYNC_STATE_TABLE)?;
@@ -720,7 +811,7 @@ impl StateStore {
 
     /// Set sync progress atomically
     pub fn set_sync_progress(&self, progress: &SyncProgress) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(SYNC_STATE_TABLE)?;
 
@@ -745,7 +836,7 @@ impl StateStore {
 
     /// Update a single sync progress field (for incremental updates)
     pub fn update_sync_field(&self, field: &str, value: u64) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(SYNC_STATE_TABLE)?;
             table.insert(field, value.to_le_bytes().as_slice())?;
@@ -756,7 +847,7 @@ impl StateStore {
 
     /// Reset sync progress (for fresh start)
     pub fn reset_sync_progress(&self) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(SYNC_STATE_TABLE)?;
             // Delete all keys by iterating and removing

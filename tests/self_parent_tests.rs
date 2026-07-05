@@ -21,23 +21,8 @@
 mod common;
 
 use common::{create_temp_dir, generate_long_document, TestDocument};
-use incrededup::{resolve_transitivity, run_disk_dedupe, DiskLSH, MatchStore, RMinHash, NUM_PERM};
+use incrededup::{compute_signature, resolve_transitivity, run_disk_dedupe, DiskLSH, MatchStore};
 use uuid::Uuid;
-
-/// Tokenize and compute signature (matching main implementation)
-fn compute_signature(content: &str, seed: u64) -> Vec<u32> {
-    let words: Vec<&str> = content.split_whitespace().filter(|w| w.len() > 1).collect();
-
-    let tokens: Vec<String> = if words.len() < 3 {
-        words.iter().map(|s| s.to_string()).collect()
-    } else {
-        words.windows(3).map(|w| w.join(" ")).collect()
-    };
-
-    let mut minhash = RMinHash::new(NUM_PERM, seed);
-    minhash.update(&tokens);
-    minhash.digest_owned()
-}
 
 /// Build a test LSH index with known documents
 /// Returns the path to the LSH file (drops the DiskLSH to release the lock)

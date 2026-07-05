@@ -16,9 +16,10 @@
 
 use crate::db::{DbConfig, DbPool, Document, DupeMatch};
 use crate::lsh::{DiskLSH, InMemoryLSH};
-use crate::minhash::{jaccard_from_signatures, RMinHash, NUM_PERM};
+use crate::minhash::jaccard_from_signatures;
 use crate::sources::{DocumentSource, SourceDupeMatch};
-use crate::storage::{FilteredParentStore, MatchRecord, MatchStore};
+use crate::storage::{ConnectedEdgeStats, FilteredParentStore, MatchRecord, MatchStore};
+use crate::tokenizer::compute_signature;
 use crate::union_find::UnionFind;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,26 +27,30 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// Log current RSS memory usage (Linux only)
+/// Current RSS memory usage in MiB (Linux only).
 #[cfg(target_os = "linux")]
-fn log_memory(label: &str) {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        if let Some(line) = status.lines().find(|l| l.starts_with("VmRSS:")) {
-            if let Some(kb_str) = line.split_whitespace().nth(1) {
-                if let Ok(kb) = kb_str.parse::<f64>() {
-                    let mb = kb / 1024.0;
-                    info!("[MEMORY] {}: {:.1} MB ({:.2} GB)", label, mb, mb / 1024.0);
-                }
-            }
-        }
-    }
+fn current_rss_mb() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb = line.split_whitespace().nth(1)?.parse::<f64>().ok()?;
+    Some(kb / 1024.0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn log_memory(_label: &str) {}
+fn current_rss_mb() -> Option<f64> {
+    None
+}
+
+/// Log current RSS memory usage.
+fn log_memory(label: &str) {
+    if let Some(mb) = current_rss_mb() {
+        info!("[MEMORY] {}: {:.1} MB ({:.2} GB)", label, mb, mb / 1024.0);
+    }
+}
 
 /// How Phase 3 loads historical match edges connected to the current batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +102,8 @@ pub struct DedupeConfig {
     pub min_content_length: i32,
     /// Lookup strategy for connected historical match edges in Phase 3.
     pub edge_lookup_mode: EdgeLookupMode,
+    /// Keep only the top-M Phase 2 matches per processed document.
+    pub max_matches_per_doc: Option<usize>,
 }
 
 impl Default for DedupeConfig {
@@ -116,97 +123,273 @@ impl Default for DedupeConfig {
             disk_phase2: true,
             min_content_length: 500, // Match Python version - skip docs <= 500 UTF-8 bytes
             edge_lookup_mode: EdgeLookupMode::Scan,
+            max_matches_per_doc: None,
         }
     }
 }
 
-fn normalized_match_records(records: &[MatchRecord]) -> Vec<(Uuid, Uuid, u64, i32, u64)> {
-    let mut normalized: Vec<_> = records
-        .iter()
-        .map(|record| {
-            (
-                record.child_id,
-                record.parent_id,
-                record.jaccard_similarity.to_bits(),
-                record.size_difference,
-                record.size_difference_pct.to_bits(),
-            )
-        })
-        .collect();
-    normalized.sort_unstable();
-    normalized
+#[derive(Debug, Clone, Copy, Default)]
+struct Phase3StreamStats {
+    edges_streamed: u64,
+    nodes_seen: usize,
+    used_adjacency_index: bool,
+    peak_rss_mb: Option<f64>,
+    elapsed_secs: f64,
 }
 
-fn load_connected_matches(
+#[derive(Debug, Clone, Copy, Default)]
+struct Phase3SyncOutcome {
+    connected_edges: u64,
+    new_children: usize,
+}
+
+struct StreamedTransitivity {
+    assignments: Vec<DupeMatch>,
+    parent_ids: HashSet<Uuid>,
+    child_ids: HashSet<Uuid>,
+}
+
+fn stream_connected_matches<F>(
     matches_store: &MatchStore,
     seed_doc_ids: &[Uuid],
     mode: EdgeLookupMode,
     label: &str,
-) -> Result<Vec<MatchRecord>> {
-    match mode {
-        EdgeLookupMode::Scan => matches_store.get_real_edges_connected_to(seed_doc_ids),
-        EdgeLookupMode::Auto => {
-            let (records, used_index) =
-                matches_store.get_real_edges_connected_to_auto(seed_doc_ids)?;
-            if used_index {
-                info!(
-                    "Loaded {} connected match edges for {} using adjacency index",
-                    records.len(),
-                    label
-                );
-            } else {
-                info!(
-                    "Loaded {} connected match edges for {} using full scan; adjacency index is not built",
-                    records.len(),
-                    label
-                );
+    pass: &str,
+    mut visitor: F,
+) -> Result<Phase3StreamStats>
+where
+    F: FnMut(&MatchRecord) -> Result<()>,
+{
+    const LOG_EVERY: u64 = 1_000_000;
+
+    let start = Instant::now();
+    let mut edges_seen = 0u64;
+    let mut peak_rss_mb = current_rss_mb();
+
+    let connected_stats: ConnectedEdgeStats = {
+        let mut wrapped_visitor = |record: &MatchRecord| -> Result<()> {
+            edges_seen += 1;
+            if let Some(mb) = current_rss_mb() {
+                peak_rss_mb = Some(peak_rss_mb.map_or(mb, |peak| peak.max(mb)));
             }
-            Ok(records)
+            if edges_seen % LOG_EVERY == 0 {
+                match peak_rss_mb {
+                    Some(peak) => info!(
+                        "Phase 3 {} for {} streamed {} edges so far; peak RSS {:.1} MB",
+                        pass, label, edges_seen, peak
+                    ),
+                    None => info!(
+                        "Phase 3 {} for {} streamed {} edges so far",
+                        pass, label, edges_seen
+                    ),
+                }
+            }
+            visitor(record)
+        };
+
+        match mode {
+            EdgeLookupMode::Scan => {
+                matches_store.visit_real_edges_connected_to(seed_doc_ids, &mut wrapped_visitor)?
+            }
+            EdgeLookupMode::Auto => matches_store
+                .visit_real_edges_connected_to_auto(seed_doc_ids, &mut wrapped_visitor)?,
+            EdgeLookupMode::Shadow => {
+                let scan_stats = matches_store
+                    .visit_real_edges_connected_to(seed_doc_ids, &mut wrapped_visitor)?;
+
+                if matches_store.is_adjacency_built()? {
+                    let indexed_start = Instant::now();
+                    let indexed_stats = matches_store
+                        .visit_real_edges_connected_to_indexed(seed_doc_ids, |_| Ok(()))?;
+                    if indexed_stats.edges_streamed == scan_stats.edges_streamed
+                        && indexed_stats.nodes_seen == scan_stats.nodes_seen
+                    {
+                        info!(
+                            "Adjacency shadow streaming check passed for {} {}: {} edges, {} nodes, index {:.2}s",
+                            label,
+                            pass,
+                            indexed_stats.edges_streamed,
+                            indexed_stats.nodes_seen,
+                            indexed_start.elapsed().as_secs_f64()
+                        );
+                    } else {
+                        warn!(
+                            "ADJACENCY_SHADOW_STREAM_MISMATCH for {} {}: scan_edges={}, indexed_edges={}, scan_nodes={}, indexed_nodes={}",
+                            label,
+                            pass,
+                            scan_stats.edges_streamed,
+                            indexed_stats.edges_streamed,
+                            scan_stats.nodes_seen,
+                            indexed_stats.nodes_seen
+                        );
+                    }
+                } else {
+                    info!(
+                        "Adjacency shadow skipped for {} {}; index is not built",
+                        label, pass
+                    );
+                }
+
+                scan_stats
+            }
         }
-        EdgeLookupMode::Shadow => {
-            let scan_start = std::time::Instant::now();
-            let scan_records = matches_store.get_real_edges_connected_to(seed_doc_ids)?;
-            let scan_elapsed = scan_start.elapsed();
+    };
 
-            if !matches_store.is_adjacency_built()? {
-                info!(
-                    "Adjacency shadow skipped for {}; index is not built. Full scan returned {} edges in {:.2}s",
-                    label,
-                    scan_records.len(),
-                    scan_elapsed.as_secs_f64()
-                );
-                return Ok(scan_records);
+    let stats = Phase3StreamStats {
+        edges_streamed: connected_stats.edges_streamed,
+        nodes_seen: connected_stats.nodes_seen,
+        used_adjacency_index: connected_stats.used_adjacency_index,
+        peak_rss_mb,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    };
+
+    let lookup = if stats.used_adjacency_index {
+        "adjacency index"
+    } else {
+        "full scan"
+    };
+    match stats.peak_rss_mb {
+        Some(peak) => info!(
+            "Phase 3 {} for {} streamed {} connected edges across {} nodes using {} in {:.2}s; peak RSS {:.1} MB",
+            pass,
+            label,
+            stats.edges_streamed,
+            stats.nodes_seen,
+            lookup,
+            stats.elapsed_secs,
+            peak
+        ),
+        None => info!(
+            "Phase 3 {} for {} streamed {} connected edges across {} nodes using {} in {:.2}s",
+            pass,
+            label,
+            stats.edges_streamed,
+            stats.nodes_seen,
+            lookup,
+            stats.elapsed_secs
+        ),
+    }
+
+    Ok(stats)
+}
+
+fn discover_streamed_component_doc_ids(
+    matches_store: &MatchStore,
+    seed_doc_ids: &[Uuid],
+    mode: EdgeLookupMode,
+    label: &str,
+) -> Result<(Vec<Uuid>, Phase3StreamStats)> {
+    let mut component_doc_ids = HashSet::new();
+    let stats = stream_connected_matches(
+        matches_store,
+        seed_doc_ids,
+        mode,
+        label,
+        "component discovery",
+        |record| {
+            component_doc_ids.insert(record.child_id);
+            component_doc_ids.insert(record.parent_id);
+            Ok(())
+        },
+    )?;
+
+    let mut ids: Vec<Uuid> = component_doc_ids.into_iter().collect();
+    ids.sort();
+    Ok((ids, stats))
+}
+
+fn resolve_transitivity_streamed(
+    matches_store: &MatchStore,
+    seed_doc_ids: &[Uuid],
+    mode: EdgeLookupMode,
+    label: &str,
+    preferred_parent_ids: &HashSet<Uuid>,
+    new_doc_set: &HashSet<Uuid>,
+) -> Result<StreamedTransitivity> {
+    let mut uf = UnionFind::new();
+    let mut best_similarity: HashMap<Uuid, (Uuid, Uuid, f64, i32, f64)> = HashMap::new();
+
+    stream_connected_matches(
+        matches_store,
+        seed_doc_ids,
+        mode,
+        label,
+        "transitivity resolution",
+        |record| {
+            uf.make_set(record.child_id);
+            uf.make_set(record.parent_id);
+            uf.union_by_key(record.child_id, record.parent_id, |id| {
+                let priority = if preferred_parent_ids.contains(&id) {
+                    0u8
+                } else if new_doc_set.contains(&id) {
+                    2u8
+                } else {
+                    1u8
+                };
+                (priority, id)
+            });
+
+            for doc_id in [record.child_id, record.parent_id] {
+                best_similarity
+                    .entry(doc_id)
+                    .and_modify(|e| {
+                        if record.jaccard_similarity > e.2
+                            || (record.jaccard_similarity == e.2
+                                && (record.child_id, record.parent_id) < (e.0, e.1))
+                        {
+                            *e = (
+                                record.child_id,
+                                record.parent_id,
+                                record.jaccard_similarity,
+                                record.size_difference,
+                                record.size_difference_pct,
+                            );
+                        }
+                    })
+                    .or_insert((
+                        record.child_id,
+                        record.parent_id,
+                        record.jaccard_similarity,
+                        record.size_difference,
+                        record.size_difference_pct,
+                    ));
             }
 
-            let indexed_start = std::time::Instant::now();
-            let indexed_records =
-                matches_store.get_real_edges_connected_to_indexed(seed_doc_ids)?;
-            let indexed_elapsed = indexed_start.elapsed();
+            Ok(())
+        },
+    )?;
 
-            let scan_normalized = normalized_match_records(&scan_records);
-            let indexed_normalized = normalized_match_records(&indexed_records);
-            if scan_normalized == indexed_normalized {
-                info!(
-                    "Adjacency shadow check passed for {}: {} edges, scan {:.2}s, index {:.2}s",
-                    label,
-                    scan_records.len(),
-                    scan_elapsed.as_secs_f64(),
-                    indexed_elapsed.as_secs_f64()
-                );
-            } else {
-                warn!(
-                    "ADJACENCY_SHADOW_MISMATCH for {}: scan_edges={}, indexed_edges={}, scan_time={:.2}s, indexed_time={:.2}s",
-                    label,
-                    scan_records.len(),
-                    indexed_records.len(),
-                    scan_elapsed.as_secs_f64(),
-                    indexed_elapsed.as_secs_f64()
-                );
-            }
+    let mut assignments = Vec::new();
+    let mut parent_ids = HashSet::new();
+    let mut child_ids = HashSet::new();
 
-            Ok(scan_records)
+    for node in uf.nodes() {
+        let root = uf.find(node);
+        if root != node {
+            child_ids.insert(node);
+            parent_ids.insert(root);
+            let (_, _, similarity, size_diff, size_diff_pct) = best_similarity
+                .get(&node)
+                .copied()
+                .unwrap_or((Uuid::nil(), Uuid::nil(), 0.8, 0, 0.0));
+            assignments.push(DupeMatch {
+                child_id: node,
+                parent_id: root,
+                jaccard_similarity: similarity,
+                size_difference: size_diff,
+                size_difference_pct: size_diff_pct,
+            });
+        } else {
+            parent_ids.insert(node);
         }
     }
+
+    assignments.sort_by_key(|m| (m.child_id, m.parent_id));
+    Ok(StreamedTransitivity {
+        assignments,
+        parent_ids,
+        child_ids,
+    })
 }
 
 /// Statistics from deduplication run
@@ -219,18 +402,6 @@ pub struct DedupeStats {
     pub duration_secs: f64,
     pub skipped_short: usize,
     pub skipped_boilerplate: usize,
-}
-
-/// Tokenize document content into shingles
-fn tokenize(content: &str) -> Vec<String> {
-    // Simple word-based tokenization with 3-word shingles
-    let words: Vec<&str> = content.split_whitespace().filter(|w| w.len() > 1).collect();
-
-    if words.len() < 3 {
-        return words.iter().map(|s| s.to_string()).collect();
-    }
-
-    words.windows(3).map(|w| w.join(" ")).collect()
 }
 
 /// Load junk patterns from a file. Each line is treated as a pattern.
@@ -293,17 +464,6 @@ pub fn is_boilerplate(content: &str, custom_patterns: &[String]) -> bool {
     false
 }
 
-/// Compute MinHash signature for a document
-fn compute_signature(content: &str, seed: u64) -> Vec<u32> {
-    let mut tokens = tokenize(content);
-    if tokens.is_empty() {
-        tokens.push(content.to_string());
-    }
-    let mut minhash = RMinHash::new(NUM_PERM, seed);
-    minhash.update(&tokens);
-    minhash.digest_owned()
-}
-
 /// Remove pathological documents from the current Phase 2 batch and return only
 /// the pathological IDs that were actually part of this run.
 fn take_pathological_batch_ids(
@@ -357,6 +517,9 @@ fn validate_dedupe_config(config: &DedupeConfig) -> Result<()> {
     if config.min_content_length < 0 {
         anyhow::bail!("min_content_length must be non-negative");
     }
+    if config.max_matches_per_doc == Some(0) {
+        anyhow::bail!("max_matches_per_doc must be positive when set");
+    }
     Ok(())
 }
 
@@ -393,16 +556,6 @@ fn flush_filtered_parents_sidecar(dataset_dir: &Path, buffer: &mut Vec<Uuid>) ->
         buffer.clear();
     }
     Ok(())
-}
-
-fn match_doc_ids(matches: &[MatchRecord]) -> Vec<Uuid> {
-    let mut ids: Vec<Uuid> = matches
-        .iter()
-        .flat_map(|m| [m.child_id, m.parent_id])
-        .collect();
-    ids.sort();
-    ids.dedup();
-    ids
 }
 
 fn assignments_requiring_write(
@@ -1113,18 +1266,10 @@ pub async fn run_dedupe(db_config: DbConfig, dedupe_config: DedupeConfig) -> Res
     let skip_phase2 = new_doc_ids.is_empty();
 
     log_memory("Before Phase 2");
-    let (new_matches, candidates_checked) = if skip_phase2 {
+    let (phase3_seed_doc_ids, candidates_checked) = if skip_phase2 {
         // All docs are pathological - no Phase 2 needed, matches already in redb
         info!("=== Phase 2: Skipped (only pathological docs) ===");
-        let matches_path = dataset_dir.join("matches.redb");
-        let matches_store = crate::storage::MatchStore::open(&matches_path)?;
-        let matches = load_connected_matches(
-            &matches_store,
-            &pathological_batch_doc_ids,
-            dedupe_config.edge_lookup_mode,
-            "database pathological batch",
-        )?;
-        (matches, 0)
+        (pathological_batch_doc_ids.clone(), 0)
     } else {
         if !dedupe_config.disk_phase2 {
             warn!("In-memory Phase 2 has been removed; using disk-based Phase 2");
@@ -1133,45 +1278,24 @@ pub async fn run_dedupe(db_config: DbConfig, dedupe_config: DedupeConfig) -> Res
         drop(lsh); // Release file lock
         info!("Released LSH index lock for Phase 2");
 
-        let disk_stats = crate::disk_dedupe::run_disk_dedupe(
+        let disk_stats = crate::disk_dedupe::run_disk_dedupe_with_options(
             &lsh_path,
             &dataset_dir,
-            dedupe_config.num_workers,
-            dedupe_config.threshold,
-            dedupe_config.size_diff_threshold,
-            false,
-            Some(new_doc_ids.clone()),
+            crate::disk_dedupe::DiskDedupeRunOptions {
+                num_workers: dedupe_config.num_workers,
+                threshold: dedupe_config.threshold,
+                size_diff_threshold: dedupe_config.size_diff_threshold,
+                fresh: false,
+                new_doc_ids: Some(new_doc_ids.clone()),
+                max_matches_per_doc: dedupe_config.max_matches_per_doc,
+            },
         )?;
 
-        // For disk-based mode, read matches from matches.redb instead of keeping in memory
-        // This is critical for large datasets to avoid OOM
-        info!("Reading matches from disk for Phase 3 sync...");
-        let matches_path = dataset_dir.join("matches.redb");
-        let matches_store = crate::storage::MatchStore::open(&matches_path)?;
-        let new_matches_disk = load_connected_matches(
-            &matches_store,
-            &new_doc_ids,
-            dedupe_config.edge_lookup_mode,
-            "database incremental batch",
-        )?;
-
-        let new_matches: Vec<MatchRecord> = new_matches_disk
-            .iter()
-            .map(|m| MatchRecord {
-                child_id: m.child_id,
-                parent_id: m.parent_id,
-                jaccard_similarity: m.jaccard_similarity,
-                size_difference: m.size_difference,
-                size_difference_pct: m.size_difference_pct,
-            })
-            .collect();
-
-        (new_matches, disk_stats.candidates_checked)
+        (new_doc_ids.clone(), disk_stats.candidates_checked)
     };
 
     info!(
-        "Phase 2 complete: found {} new duplicates from {} candidates.",
-        new_matches.len(),
+        "Phase 2 complete: checked {} candidates. Phase 3 will stream connected duplicate edges.",
         candidates_checked
     );
     log_memory("After Phase 2");
@@ -1187,27 +1311,40 @@ pub async fn run_dedupe(db_config: DbConfig, dedupe_config: DedupeConfig) -> Res
     // ============================================================
     // PHASE 3: Sync to PostgreSQL
     // ============================================================
-    if !dedupe_config.skip_db_write {
+    let phase3_outcome = if !dedupe_config.skip_db_write {
         log_memory("Before Phase 3");
         info!("");
         info!("=== Phase 3: Syncing to PostgreSQL ===");
-        perform_incremental_sync(&pool, &new_matches, &new_doc_ids, dedupe_config.batch_size)
-            .await?;
+        let matches_store = crate::storage::MatchStore::open(dataset_dir.join("matches.redb"))?;
+        let outcome = perform_incremental_sync_streaming(
+            &pool,
+            &matches_store,
+            &phase3_seed_doc_ids,
+            &new_doc_ids,
+            dedupe_config.edge_lookup_mode,
+            "database incremental batch",
+            dedupe_config.batch_size,
+        )
+        .await?;
         log_memory("After Phase 3");
+        outcome
     } else {
         info!("");
         info!("=== Skipping PostgreSQL sync (--skip-db-write) ===");
-    }
+        Phase3SyncOutcome::default()
+    };
 
     let duration = start.elapsed();
-    let final_parents = new_doc_ids.len().saturating_sub(new_matches.len())
+    let final_parents = new_doc_ids
+        .len()
+        .saturating_sub(phase3_outcome.new_children)
         + short_doc_count
         + boilerplate_doc_count;
     log_memory("run_dedupe end");
 
     Ok(DedupeStats {
         total_documents: total as usize,
-        duplicates_found: new_matches.len(),
+        duplicates_found: usize::try_from(phase3_outcome.connected_edges).unwrap_or(usize::MAX),
         unique_parents: final_parents,
         candidates_checked,
         duration_secs: duration.as_secs_f64(),
@@ -1521,18 +1658,10 @@ pub async fn run_dedupe_with_source<S: DocumentSource>(
     let skip_phase2 = new_doc_ids.is_empty();
 
     log_memory("Before Phase 2");
-    let (new_matches, candidates_checked) = if skip_phase2 {
+    let (phase3_seed_doc_ids, candidates_checked) = if skip_phase2 {
         // All docs are pathological - no Phase 2 needed, matches already in redb
         info!("=== Phase 2: Skipped (only pathological docs) ===");
-        let matches_path = dataset_dir.join("matches.redb");
-        let matches_store = crate::storage::MatchStore::open(&matches_path)?;
-        let matches = load_connected_matches(
-            &matches_store,
-            &pathological_batch_doc_ids,
-            dedupe_config.edge_lookup_mode,
-            "source pathological batch",
-        )?;
-        (matches, 0)
+        (pathological_batch_doc_ids.clone(), 0)
     } else {
         if !dedupe_config.disk_phase2 {
             warn!("In-memory Phase 2 has been removed; using disk-based Phase 2");
@@ -1541,45 +1670,24 @@ pub async fn run_dedupe_with_source<S: DocumentSource>(
         drop(lsh); // Release file lock
         info!("Released LSH index lock for Phase 2");
 
-        let disk_stats = crate::disk_dedupe::run_disk_dedupe(
+        let disk_stats = crate::disk_dedupe::run_disk_dedupe_with_options(
             &lsh_path,
             &dataset_dir,
-            dedupe_config.num_workers,
-            dedupe_config.threshold,
-            dedupe_config.size_diff_threshold,
-            false,
-            Some(new_doc_ids.clone()),
+            crate::disk_dedupe::DiskDedupeRunOptions {
+                num_workers: dedupe_config.num_workers,
+                threshold: dedupe_config.threshold,
+                size_diff_threshold: dedupe_config.size_diff_threshold,
+                fresh: false,
+                new_doc_ids: Some(new_doc_ids.clone()),
+                max_matches_per_doc: dedupe_config.max_matches_per_doc,
+            },
         )?;
 
-        // For disk-based mode, read matches from matches.redb instead of keeping in memory
-        // This is critical for large datasets to avoid OOM
-        info!("Reading matches from disk for Phase 3 sync...");
-        let matches_path = dataset_dir.join("matches.redb");
-        let matches_store = crate::storage::MatchStore::open(&matches_path)?;
-        let new_matches_disk = load_connected_matches(
-            &matches_store,
-            &new_doc_ids,
-            dedupe_config.edge_lookup_mode,
-            "source incremental batch",
-        )?;
-
-        let new_matches: Vec<MatchRecord> = new_matches_disk
-            .iter()
-            .map(|m| MatchRecord {
-                child_id: m.child_id,
-                parent_id: m.parent_id,
-                jaccard_similarity: m.jaccard_similarity,
-                size_difference: m.size_difference,
-                size_difference_pct: m.size_difference_pct,
-            })
-            .collect();
-
-        (new_matches, disk_stats.candidates_checked)
+        (new_doc_ids.clone(), disk_stats.candidates_checked)
     };
 
     info!(
-        "Phase 2 complete: found {} new duplicates from {} candidates.",
-        new_matches.len(),
+        "Phase 2 complete: checked {} candidates. Phase 3 will stream connected duplicate edges.",
         candidates_checked
     );
     log_memory("After Phase 2");
@@ -1595,35 +1703,44 @@ pub async fn run_dedupe_with_source<S: DocumentSource>(
     // ============================================================
     // PHASE 3: Sync to Source
     // ============================================================
-    if !dedupe_config.skip_db_write && source.supports_write() {
+    let phase3_outcome = if !dedupe_config.skip_db_write && source.supports_write() {
         log_memory("Before Phase 3");
         info!("");
         info!("=== Phase 3: Syncing to Data Source ===");
-        perform_incremental_sync_generic(
+        let matches_store = crate::storage::MatchStore::open(dataset_dir.join("matches.redb"))?;
+        let outcome = perform_incremental_sync_generic_streaming(
             source,
-            &new_matches,
+            &matches_store,
+            &phase3_seed_doc_ids,
             &new_doc_ids,
+            dedupe_config.edge_lookup_mode,
+            "source incremental batch",
             dedupe_config.batch_size,
         )
         .await?;
         log_memory("After Phase 3");
+        outcome
     } else if dedupe_config.skip_db_write {
         info!("");
         info!("=== Skipping sync (--skip-db-write) ===");
+        Phase3SyncOutcome::default()
     } else {
         info!("");
         info!("=== Skipping sync (source does not support write) ===");
-    }
+        Phase3SyncOutcome::default()
+    };
 
     let duration = start.elapsed();
-    let final_parents = new_doc_ids.len().saturating_sub(new_matches.len())
+    let final_parents = new_doc_ids
+        .len()
+        .saturating_sub(phase3_outcome.new_children)
         + short_doc_count
         + boilerplate_doc_count;
     log_memory("run_dedupe_with_source end");
 
     Ok(DedupeStats {
         total_documents: total as usize,
-        duplicates_found: new_matches.len(),
+        duplicates_found: usize::try_from(phase3_outcome.connected_edges).unwrap_or(usize::MAX),
         unique_parents: final_parents,
         candidates_checked,
         duration_secs: duration.as_secs_f64(),
@@ -1637,49 +1754,57 @@ pub async fn run_dedupe_with_source<S: DocumentSource>(
 /// IMPORTANT: This function receives all touched component edges for correct
 /// union-find. It syncs new documents plus any historical assignments that
 /// actually changed because the new batch bridged existing clusters.
-async fn perform_incremental_sync_generic<S: DocumentSource>(
+async fn perform_incremental_sync_generic_streaming<S: DocumentSource>(
     source: &S,
-    all_matches: &[MatchRecord],
+    matches_store: &MatchStore,
+    phase3_seed_doc_ids: &[Uuid],
     new_doc_ids: &[Uuid],
+    edge_lookup_mode: EdgeLookupMode,
+    label: &str,
     batch_size: i64,
-) -> Result<()> {
+) -> Result<Phase3SyncOutcome> {
     let batch_size = batch_size_usize(batch_size)?;
     info!(
-        "Starting incremental sync for {} new documents...",
+        "Starting streaming incremental sync for {} new documents...",
         new_doc_ids.len()
     );
 
-    // Build a set for O(1) lookup of new doc IDs
-    let new_doc_set: std::collections::HashSet<Uuid> = new_doc_ids.iter().copied().collect();
+    let new_doc_set: HashSet<Uuid> = new_doc_ids.iter().copied().collect();
+    let (component_doc_ids, discovery_stats) = discover_streamed_component_doc_ids(
+        matches_store,
+        phase3_seed_doc_ids,
+        edge_lookup_mode,
+        label,
+    )?;
 
-    let component_doc_ids = match_doc_ids(all_matches);
     let existing_parent_ids = source.fetch_existing_parent_ids(&component_doc_ids).await?;
     let existing_dupe_parents = source
         .fetch_existing_dupe_parents(&component_doc_ids)
         .await?;
 
-    // Step 1: Resolve transitivity on all touched edges. In incremental mode,
-    // prefer already-marked parents so a later lower UUID does not destabilize
-    // historical canonical assignments.
-    let (resolved_matches, all_parent_ids, all_child_ids) =
-        resolve_transitivity_with_preferred_roots(
-            all_matches,
-            &existing_parent_ids,
-            Some(&new_doc_set),
-        );
+    let StreamedTransitivity {
+        assignments: resolved_matches,
+        parent_ids: all_parent_ids,
+        child_ids: all_child_ids,
+    } = resolve_transitivity_streamed(
+        matches_store,
+        phase3_seed_doc_ids,
+        edge_lookup_mode,
+        label,
+        &existing_parent_ids,
+        &new_doc_set,
+    )?;
 
-    // Step 2: Keep matches where child is in new_doc_ids or where an existing
-    // assignment changed because a new doc bridged clusters.
     let assignments_to_write =
         assignments_requiring_write(&resolved_matches, &new_doc_set, &existing_dupe_parents);
 
     info!(
-        "Resolved {} total matches, {} require source writes.",
+        "Resolved {} total matches from {} streamed component edges; {} require source writes.",
         resolved_matches.len(),
+        discovery_stats.edges_streamed,
         assignments_to_write.len()
     );
 
-    // Step 3: Write only assignments that are new or changed.
     if !assignments_to_write.is_empty() {
         info!(
             "Writing {} new assignments to source...",
@@ -1701,7 +1826,11 @@ async fn perform_incremental_sync_generic<S: DocumentSource>(
         }
     }
 
-    // Step 4: Mark new children and any historical parent that became a child.
+    let new_children = all_child_ids
+        .iter()
+        .filter(|id| new_doc_set.contains(id))
+        .count();
+
     if source.tracks_state() {
         let child_ids_to_mark =
             child_marks_to_apply(&all_child_ids, &new_doc_set, &existing_parent_ids);
@@ -1716,10 +1845,6 @@ async fn perform_incremental_sync_generic<S: DocumentSource>(
             }
         }
 
-        // Step 5: Mark all NEW documents that are NOT children as parents
-        // This includes both:
-        // - Cluster roots (docs that have children pointing to them)
-        // - Unique docs (docs with no matches at all)
         let parent_ids_to_mark = parent_marks_to_apply(
             &all_parent_ids,
             new_doc_ids,
@@ -1738,8 +1863,11 @@ async fn perform_incremental_sync_generic<S: DocumentSource>(
         }
     }
 
-    info!("Incremental sync complete.");
-    Ok(())
+    info!("Streaming incremental sync complete.");
+    Ok(Phase3SyncOutcome {
+        connected_edges: discovery_stats.edges_streamed,
+        new_children,
+    })
 }
 
 /// Performs a fully incremental sync to the database.
@@ -1752,49 +1880,57 @@ async fn perform_incremental_sync_generic<S: DocumentSource>(
 /// 2. Writes new or changed child records to the `dupes` table.
 /// 3. Marks new children and changed historical roots as `is_parent = false`.
 /// 4. Marks new parents and changed historical children as `is_parent = true`.
-async fn perform_incremental_sync(
+async fn perform_incremental_sync_streaming(
     pool: &DbPool,
-    all_matches: &[MatchRecord],
+    matches_store: &MatchStore,
+    phase3_seed_doc_ids: &[Uuid],
     new_doc_ids: &[Uuid],
+    edge_lookup_mode: EdgeLookupMode,
+    label: &str,
     batch_size: i64,
-) -> Result<()> {
+) -> Result<Phase3SyncOutcome> {
     let batch_size = batch_size_usize(batch_size)?;
     info!(
-        "Starting incremental sync for {} new documents...",
+        "Starting streaming incremental sync for {} new documents...",
         new_doc_ids.len()
     );
 
-    // Build a set for O(1) lookup of new doc IDs
-    let new_doc_set: std::collections::HashSet<Uuid> = new_doc_ids.iter().copied().collect();
+    let new_doc_set: HashSet<Uuid> = new_doc_ids.iter().copied().collect();
+    let (component_doc_ids, discovery_stats) = discover_streamed_component_doc_ids(
+        matches_store,
+        phase3_seed_doc_ids,
+        edge_lookup_mode,
+        label,
+    )?;
 
-    let component_doc_ids = match_doc_ids(all_matches);
     let existing_parent_ids = pool.fetch_parent_ids_by_doc_ids(&component_doc_ids).await?;
     let existing_dupe_parents = pool
         .fetch_dupe_parents_by_child_ids(&component_doc_ids)
         .await?;
 
-    // Step 1: Resolve transitivity on all touched edges. Prefer existing
-    // canonical parents so incremental runs do not choose a newly-arrived lower
-    // UUID as root unless no historical parent exists.
-    let (resolved_matches, all_parent_ids, all_child_ids) =
-        resolve_transitivity_with_preferred_roots(
-            all_matches,
-            &existing_parent_ids,
-            Some(&new_doc_set),
-        );
+    let StreamedTransitivity {
+        assignments: resolved_matches,
+        parent_ids: all_parent_ids,
+        child_ids: all_child_ids,
+    } = resolve_transitivity_streamed(
+        matches_store,
+        phase3_seed_doc_ids,
+        edge_lookup_mode,
+        label,
+        &existing_parent_ids,
+        &new_doc_set,
+    )?;
 
-    // Step 2: Write new child assignments and any historical assignments that
-    // actually changed because the current batch bridged existing clusters.
     let assignments_to_write =
         assignments_requiring_write(&resolved_matches, &new_doc_set, &existing_dupe_parents);
 
     info!(
-        "Resolved {} total matches, {} require database writes.",
+        "Resolved {} total matches from {} streamed component edges; {} require database writes.",
         resolved_matches.len(),
+        discovery_stats.edges_streamed,
         assignments_to_write.len()
     );
 
-    // Step 3: Write only assignments that are new or changed.
     if !assignments_to_write.is_empty() {
         info!(
             "Writing {} new assignments to database...",
@@ -1805,7 +1941,6 @@ async fn perform_incremental_sync(
         }
     }
 
-    // Step 4: Mark new children and any historical parent that became a child.
     let child_ids_to_mark =
         child_marks_to_apply(&all_child_ids, &new_doc_set, &existing_parent_ids);
 
@@ -1819,10 +1954,6 @@ async fn perform_incremental_sync(
         }
     }
 
-    // Step 5: Mark all NEW documents that are NOT children as parents
-    // This includes both:
-    // - Cluster roots (docs that have children pointing to them)
-    // - Unique docs (docs with no matches at all)
     let parent_ids_to_mark = parent_marks_to_apply(
         &all_parent_ids,
         new_doc_ids,
@@ -1840,8 +1971,16 @@ async fn perform_incremental_sync(
         }
     }
 
-    info!("Incremental sync complete.");
-    Ok(())
+    let new_children = all_child_ids
+        .iter()
+        .filter(|id| new_doc_set.contains(id))
+        .count();
+
+    info!("Streaming incremental sync complete.");
+    Ok(Phase3SyncOutcome {
+        connected_edges: discovery_stats.edges_streamed,
+        new_children,
+    })
 }
 
 /// Resolve transitivity using Union-Find to ensure consistent parent assignments.
@@ -1889,15 +2028,21 @@ fn resolve_transitivity_with_preferred_roots(
 
     // Track the best similarity score for each document, regardless of the
     // raw edge direction. Incremental root preferences can make either endpoint
-    // become the canonical child after transitivity resolution.
-    let mut best_similarity: HashMap<Uuid, (f64, i32, f64)> = HashMap::new();
+    // become the canonical child after transitivity resolution. Equal-Jaccard
+    // ties use the lowest stored edge key so the aggregate is independent of
+    // scan order.
+    let mut best_similarity: HashMap<Uuid, (Uuid, Uuid, f64, i32, f64)> = HashMap::new();
 
     let mut update_best = |doc_id: Uuid, m: &MatchRecord| {
         best_similarity
             .entry(doc_id)
             .and_modify(|e| {
-                if m.jaccard_similarity > e.0 {
+                if m.jaccard_similarity > e.2
+                    || (m.jaccard_similarity == e.2 && (m.child_id, m.parent_id) < (e.0, e.1))
+                {
                     *e = (
+                        m.child_id,
+                        m.parent_id,
                         m.jaccard_similarity,
                         m.size_difference,
                         m.size_difference_pct,
@@ -1905,6 +2050,8 @@ fn resolve_transitivity_with_preferred_roots(
                 }
             })
             .or_insert((
+                m.child_id,
+                m.parent_id,
                 m.jaccard_similarity,
                 m.size_difference,
                 m.size_difference_pct,
@@ -1947,8 +2094,10 @@ fn resolve_transitivity_with_preferred_roots(
             parent_ids.insert(root);
 
             // Get the best similarity score we have for this child
-            let (similarity, size_diff, size_diff_pct) =
-                best_similarity.get(&node).copied().unwrap_or((0.8, 0, 0.0));
+            let (_, _, similarity, size_diff, size_diff_pct) = best_similarity
+                .get(&node)
+                .copied()
+                .unwrap_or((Uuid::nil(), Uuid::nil(), 0.8, 0, 0.0));
 
             assignments.push(DupeMatch {
                 child_id: node,
@@ -1971,6 +2120,7 @@ fn resolve_transitivity_with_preferred_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::tokenize;
 
     #[test]
     fn test_size_within_threshold() {
@@ -1997,11 +2147,13 @@ mod tests {
 
     #[test]
     fn test_tokenize() {
-        let text = "hello world test document";
+        let text = "新华社北京七月四日电国务院发布新的通知";
         let tokens = tokenize(text);
-        assert_eq!(tokens.len(), 2); // 4 words -> 2 shingles
-        assert_eq!(tokens[0], "hello world test");
-        assert_eq!(tokens[1], "world test document");
+        assert!(
+            tokens.len() > 10,
+            "raw Chinese should produce overlapping character n-grams"
+        );
+        assert_eq!(tokens[0], "新华社");
     }
 
     #[test]
@@ -2115,6 +2267,39 @@ mod tests {
         assert!((resolved[0].jaccard_similarity - 0.93).abs() < 0.001);
         assert_eq!(resolved[0].size_difference, 7);
         assert!((resolved[0].size_difference_pct - 0.07).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_transitivity_equal_jaccard_tie_uses_lowest_edge_key() {
+        let root = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let child = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let higher_edge_key = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+
+        let matches = vec![
+            MatchRecord {
+                child_id: higher_edge_key,
+                parent_id: child,
+                jaccard_similarity: 0.95,
+                size_difference: 99,
+                size_difference_pct: 0.99,
+            },
+            MatchRecord {
+                child_id: child,
+                parent_id: root,
+                jaccard_similarity: 0.95,
+                size_difference: 7,
+                size_difference_pct: 0.07,
+            },
+        ];
+
+        let (resolved, _, _) = resolve_transitivity(&matches);
+        let child_assignment = resolved
+            .iter()
+            .find(|m| m.child_id == child)
+            .expect("child should resolve to the root");
+        assert_eq!(child_assignment.parent_id, root);
+        assert_eq!(child_assignment.size_difference, 7);
+        assert!((child_assignment.size_difference_pct - 0.07).abs() < 0.001);
     }
 
     #[test]

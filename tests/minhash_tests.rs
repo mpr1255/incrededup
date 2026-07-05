@@ -8,26 +8,8 @@
 mod common;
 
 use common::{generate_different_pair, generate_duplicate_pair, generate_similar_pair};
-use incrededup::minhash::{jaccard_from_signatures, RMinHash, NUM_PERM};
-
-/// Tokenize content into 3-word shingles (matching the main implementation)
-fn tokenize(content: &str) -> Vec<String> {
-    let words: Vec<&str> = content.split_whitespace().filter(|w| w.len() > 1).collect();
-
-    if words.len() < 3 {
-        return words.iter().map(|s| s.to_string()).collect();
-    }
-
-    words.windows(3).map(|w| w.join(" ")).collect()
-}
-
-/// Compute MinHash signature for content
-fn compute_signature(content: &str, seed: u64) -> Vec<u32> {
-    let tokens = tokenize(content);
-    let mut minhash = RMinHash::new(NUM_PERM, seed);
-    minhash.update(&tokens);
-    minhash.digest_owned()
-}
+use incrededup::compute_signature;
+use incrededup::minhash::{jaccard_from_signatures, NUM_PERM};
 
 #[test]
 fn test_minhash_determinism() {

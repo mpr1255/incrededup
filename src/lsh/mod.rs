@@ -10,6 +10,7 @@
 //! The disk-backed version allows processing datasets larger than memory.
 
 use crate::minhash::{calculate_band_hash, NUM_BANDS, NUM_PERM, ROWS_PER_BAND};
+use crate::tokenizer::TOKENIZER_VERSION;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -30,9 +31,13 @@ const SIGNATURE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sign
 const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const METADATA_KEY: &str = "lsh_config";
 const LSH_METADATA_VERSION: u32 = 1;
-const TOKENIZER_VERSION: &str = "word_3_shingle_v1";
 const HASH_VERSION: &str = "rminhash_fx_v1";
-const DEFAULT_LEGACY_SEED: u64 = 42;
+
+fn begin_quick_repair_write(db: &Database) -> Result<redb::WriteTransaction> {
+    let mut write_txn = db.begin_write()?;
+    write_txn.set_quick_repair(true);
+    Ok(write_txn)
+}
 
 /// Metadata that determines whether an existing LSH sidecar can be reused.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -219,7 +224,7 @@ impl DiskLSH {
             .with_context(|| format!("Failed to create database at {:?}", path.as_ref()))?;
 
         // Initialize tables
-        let write_txn = db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&db)?;
         {
             let _ = write_txn.open_table(BAND_TABLE)?;
             let _ = write_txn.open_table(SIGNATURE_TABLE)?;
@@ -236,10 +241,9 @@ impl DiskLSH {
 
     /// Validate or initialize sidecar metadata for this index.
     ///
-    /// Legacy sidecars created before metadata existed are stamped as compatible
-    /// only when the run uses the historical default seed. For custom seeds,
-    /// there is no reliable way to know how the existing signatures were built,
-    /// so callers should rebuild with `fresh`.
+    /// Empty sidecars are initialized with current metadata. Populated sidecars
+    /// without metadata are not reusable because their tokenizer, hash version,
+    /// and seed cannot be verified.
     pub fn validate_or_initialize_metadata(&self, seed: u64) -> Result<()> {
         let expected = LshMetadata::current(seed, self.num_bands, self.rows_per_band);
 
@@ -262,14 +266,13 @@ impl DiskLSH {
             }
             None => {
                 let count = self.count()?;
-                if count > 0 && seed != DEFAULT_LEGACY_SEED {
+                if count > 0 {
                     anyhow::bail!(
-                        "Existing LSH sidecar has no metadata and current seed is {}. Cannot safely verify compatibility; rebuild with fresh=true/--fresh.",
-                        seed
+                        "Existing LSH sidecar has no metadata. Cannot safely verify tokenizer/hash compatibility; rebuild with fresh=true/--fresh."
                     );
                 }
 
-                let write_txn = self.db.begin_write()?;
+                let write_txn = begin_quick_repair_write(&self.db)?;
                 {
                     let mut metadata_table = write_txn.open_table(METADATA_TABLE)?;
                     let bytes = bincode::serialize(&expected)?;
@@ -284,7 +287,7 @@ impl DiskLSH {
     /// Insert a document signature into the index
     pub fn insert(&self, doc_id: Uuid, signature: Vec<u32>, content_len: usize) -> Result<()> {
         validate_signature_len(&signature, self.num_bands, self.rows_per_band)?;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
 
         {
             let mut band_table = write_txn.open_table(BAND_TABLE)?;
@@ -331,7 +334,7 @@ impl DiskLSH {
             validate_signature_len(signature, self.num_bands, self.rows_per_band)?;
         }
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
 
         {
             let mut band_table = write_txn.open_table(BAND_TABLE)?;
@@ -448,7 +451,7 @@ impl DiskLSH {
     /// Insert signatures only (no band updates) - O(1) per doc
     /// Call build_bands_from_signatures() after all signatures are inserted
     pub fn insert_signatures_only(&self, documents: &[(Uuid, Vec<u32>, usize)]) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
 
         {
             let mut sig_table = write_txn.open_table(SIGNATURE_TABLE)?;
@@ -529,7 +532,7 @@ impl DiskLSH {
                 .unwrap(),
         );
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut band_table = write_txn.open_table(BAND_TABLE)?;
 

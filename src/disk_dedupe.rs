@@ -49,6 +49,12 @@ const PHASE2_STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("
 // Metadata table for stats
 const PHASE2_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("phase2_meta");
 
+fn begin_quick_repair_write(db: &Database) -> Result<redb::WriteTransaction> {
+    let mut write_txn = db.begin_write()?;
+    write_txn.set_quick_repair(true);
+    Ok(write_txn)
+}
+
 fn lock_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -139,6 +145,14 @@ struct PendingPhase2Writes {
     processed_ids: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Phase2FlushSnapshot {
+    duplicates_found: usize,
+    candidates_checked: usize,
+    processed_this_run: usize,
+    remaining_docs: usize,
+}
+
 /// Metadata for Phase 2 state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Phase2Metadata {
@@ -159,7 +173,7 @@ impl Phase2StateStore {
             .with_context(|| format!("Failed to create state DB at {:?}", path.as_ref()))?;
 
         // Initialize tables
-        let write_txn = db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&db)?;
         {
             let _ = write_txn.open_table(PHASE2_STATE_TABLE)?;
             let _ = write_txn.open_table(PHASE2_META_TABLE)?;
@@ -204,7 +218,7 @@ impl Phase2StateStore {
             return Ok(());
         }
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(PHASE2_STATE_TABLE)?;
             let marker: &[u8] = &[1]; // Simple marker to indicate processed
@@ -237,7 +251,7 @@ impl Phase2StateStore {
             last_saved: chrono::Utc::now().to_rfc3339(),
         };
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(PHASE2_META_TABLE)?;
             let data = bincode::serialize(&meta)?;
@@ -255,7 +269,7 @@ impl Phase2StateStore {
         }
 
         let mut removed = 0;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             let mut table = write_txn.open_table(PHASE2_STATE_TABLE)?;
             for doc_id in doc_ids {
@@ -270,7 +284,7 @@ impl Phase2StateStore {
 
     /// Clear all state (for fresh start)
     pub fn clear(&self) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.db)?;
         {
             // Drop and recreate tables
             let mut table = write_txn.open_table(PHASE2_STATE_TABLE)?;
@@ -323,6 +337,17 @@ pub struct DiskDedupeStats {
     pub duration_secs: f64,
 }
 
+/// Options for `run_disk_dedupe_with_options`.
+#[derive(Debug)]
+pub struct DiskDedupeRunOptions {
+    pub num_workers: usize,
+    pub threshold: f64,
+    pub size_diff_threshold: f64,
+    pub fresh: bool,
+    pub new_doc_ids: Option<Vec<Uuid>>,
+    pub max_matches_per_doc: Option<usize>,
+}
+
 /// Phase 2: Parallel disk-based deduplicator for finding duplicate pairs.
 ///
 /// This struct handles Phase 2 of the deduplication pipeline: reading from an existing
@@ -340,6 +365,7 @@ pub struct DiskDeduplicator {
     rows_per_band: usize,
     threshold: f64,
     size_diff_threshold: f64,
+    max_matches_per_doc: Option<usize>,
 }
 
 impl DiskDeduplicator {
@@ -351,7 +377,7 @@ impl DiskDeduplicator {
             .with_context(|| format!("Failed to create output DB at {:?}", output_path.as_ref()))?;
 
         // Initialize output table
-        let write_txn = output_db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&output_db)?;
         {
             let _ = write_txn.open_table(MATCHES_TABLE)?;
             let _ = write_txn.open_table(ADJACENCY_TABLE)?;
@@ -365,6 +391,7 @@ impl DiskDeduplicator {
             rows_per_band: ROWS_PER_BAND,
             threshold: 0.8,
             size_diff_threshold: 0.3,
+            max_matches_per_doc: None,
         })
     }
 
@@ -375,6 +402,11 @@ impl DiskDeduplicator {
 
     pub fn with_size_diff_threshold(mut self, threshold: f64) -> Self {
         self.size_diff_threshold = threshold;
+        self
+    }
+
+    pub fn with_max_matches_per_doc(mut self, max_matches_per_doc: Option<usize>) -> Self {
+        self.max_matches_per_doc = max_matches_per_doc;
         self
     }
 
@@ -441,7 +473,7 @@ impl DiskDeduplicator {
         }
 
         let mut written = 0;
-        let write_txn = self.output_db.begin_write()?;
+        let write_txn = begin_quick_repair_write(&self.output_db)?;
         {
             let mut table = write_txn.open_table(MATCHES_TABLE)?;
             let mut adjacency = write_txn.open_table(ADJACENCY_TABLE)?;
@@ -480,9 +512,7 @@ impl DiskDeduplicator {
         pending_writes: &Arc<Mutex<PendingPhase2Writes>>,
         state_store: &Phase2StateStore,
         total_written: &AtomicUsize,
-        duplicates_found: usize,
-        candidates_checked: usize,
-        remaining_docs: usize,
+        snapshot: Phase2FlushSnapshot,
     ) -> Result<bool> {
         let (matches_to_write, ids_to_save) = {
             let mut pending = lock_recover(pending_writes, "pending_writes");
@@ -499,16 +529,15 @@ impl DiskDeduplicator {
         total_written.fetch_add(written, Ordering::Relaxed);
 
         state_store.mark_processed_batch(&ids_to_save)?;
-        state_store.save_metadata(duplicates_found, candidates_checked)?;
+        state_store.save_metadata(snapshot.duplicates_found, snapshot.candidates_checked)?;
 
-        let total_processed = state_store.processed_count().unwrap_or(0);
         tracing::info!(
             "Phase 2 checkpoint: {}/{} docs processed ({:.1}%), {} duplicates found, {} candidates checked",
-            total_processed,
-            remaining_docs,
-            (total_processed as f64 / remaining_docs as f64) * 100.0,
-            duplicates_found,
-            candidates_checked
+            snapshot.processed_this_run,
+            snapshot.remaining_docs,
+            (snapshot.processed_this_run as f64 / snapshot.remaining_docs as f64) * 100.0,
+            snapshot.duplicates_found,
+            snapshot.candidates_checked
         );
 
         Ok(true)
@@ -760,8 +789,6 @@ impl DiskDeduplicator {
                     let jaccard = jaccard_from_signatures(&doc.signature, &cand.signature);
 
                     if jaccard >= self.threshold {
-                        duplicates_found.fetch_add(1, Ordering::Relaxed);
-
                         // Larger document is the child
                         let (child_id, child_size, parent_id, parent_size) =
                             if doc.content_len >= cand.content_len {
@@ -798,6 +825,19 @@ impl DiskDeduplicator {
                     }
                 }
 
+                if let Some(max_matches) = self.max_matches_per_doc {
+                    if local_matches.len() > max_matches {
+                        local_matches.sort_by(|a, b| {
+                            b.jaccard_similarity
+                                .total_cmp(&a.jaccard_similarity)
+                                .then_with(|| a.child_id.cmp(&b.child_id))
+                                .then_with(|| a.parent_id.cmp(&b.parent_id))
+                        });
+                        local_matches.truncate(max_matches);
+                    }
+                }
+                duplicates_found.fetch_add(local_matches.len(), Ordering::Relaxed);
+
                 let current_processed = processed.fetch_add(1, Ordering::Relaxed) + 1;
                 let should_flush = {
                     let mut pending = lock_recover(&pending_writes, "pending_writes");
@@ -814,9 +854,12 @@ impl DiskDeduplicator {
                         &pending_writes,
                         &state_store_clone,
                         &total_written,
-                        dupes,
-                        cands,
-                        remaining_docs,
+                        Phase2FlushSnapshot {
+                            duplicates_found: dupes,
+                            candidates_checked: cands,
+                            processed_this_run: processed.load(Ordering::Relaxed),
+                            remaining_docs,
+                        },
                     ) {
                         match_write_failed.store(true, Ordering::Relaxed);
                         state_save_failed.store(true, Ordering::Relaxed);
@@ -835,9 +878,12 @@ impl DiskDeduplicator {
             &pending_writes,
             &state_store,
             &total_written,
-            duplicates_found.load(Ordering::Relaxed),
-            candidates_checked.load(Ordering::Relaxed),
-            remaining_docs,
+            Phase2FlushSnapshot {
+                duplicates_found: duplicates_found.load(Ordering::Relaxed),
+                candidates_checked: candidates_checked.load(Ordering::Relaxed),
+                processed_this_run: processed.load(Ordering::Relaxed),
+                remaining_docs,
+            },
         ) {
             match_write_failed.store(true, Ordering::Relaxed);
             state_save_failed.store(true, Ordering::Relaxed);
@@ -916,31 +962,59 @@ pub fn run_disk_dedupe(
     fresh: bool,
     new_doc_ids: Option<Vec<Uuid>>,
 ) -> Result<DiskDedupeStats> {
-    if num_workers == 0 {
+    run_disk_dedupe_with_options(
+        lsh_path,
+        output_dir,
+        DiskDedupeRunOptions {
+            num_workers,
+            threshold,
+            size_diff_threshold,
+            fresh,
+            new_doc_ids,
+            max_matches_per_doc: None,
+        },
+    )
+}
+
+/// Run disk-based deduplication with optional Phase 2 edge-graph controls.
+pub fn run_disk_dedupe_with_options(
+    lsh_path: &Path,
+    output_dir: &Path,
+    options: DiskDedupeRunOptions,
+) -> Result<DiskDedupeStats> {
+    if options.num_workers == 0 {
         anyhow::bail!("num_workers must be positive");
     }
-    if !(0.0..=1.0).contains(&threshold) {
+    if !(0.0..=1.0).contains(&options.threshold) {
         anyhow::bail!("threshold must be between 0.0 and 1.0");
     }
-    if size_diff_threshold < 0.0 {
+    if options.size_diff_threshold < 0.0 {
         anyhow::bail!("size_diff_threshold must be non-negative");
+    }
+    if options.max_matches_per_doc == Some(0) {
+        anyhow::bail!("max_matches_per_doc must be positive when set");
     }
 
     log_memory("run_disk_dedupe start");
     tracing::info!("=== Disk-Based Parallel Deduplication ===");
     tracing::info!("LSH index: {:?}", lsh_path);
     tracing::info!("Output dir: {:?}", output_dir);
-    tracing::info!("Workers: {}", num_workers);
-    tracing::info!("Threshold: {:.2}", threshold);
-    tracing::info!("Size diff threshold: {:.2}", size_diff_threshold);
-    if let Some(ref ids) = new_doc_ids {
+    tracing::info!("Workers: {}", options.num_workers);
+    tracing::info!("Threshold: {:.2}", options.threshold);
+    tracing::info!("Size diff threshold: {:.2}", options.size_diff_threshold);
+    if let Some(max_matches) = options.max_matches_per_doc {
+        tracing::info!("Max matches per doc: {}", max_matches);
+    } else {
+        tracing::info!("Max matches per doc: unlimited");
+    }
+    if let Some(ref ids) = options.new_doc_ids {
         tracing::info!("Incremental mode: {} new docs to process", ids.len());
     } else {
         tracing::info!("Full mode: processing all docs in index");
     }
     tracing::info!(
         "Resume mode: {}",
-        if !fresh {
+        if !options.fresh {
             "enabled"
         } else {
             "disabled (--fresh)"
@@ -953,7 +1027,7 @@ pub fn run_disk_dedupe(
     let state_path = output_dir.join("state.redb");
 
     // If fresh mode, remove existing files
-    if fresh {
+    if options.fresh {
         if output_path.exists() {
             std::fs::remove_file(&output_path)?;
             tracing::info!("Removed existing matches file");
@@ -966,11 +1040,17 @@ pub fn run_disk_dedupe(
 
     // Open deduplicator
     let deduper = DiskDeduplicator::open(lsh_path, &output_path)?
-        .with_threshold(threshold)
-        .with_size_diff_threshold(size_diff_threshold);
+        .with_threshold(options.threshold)
+        .with_size_diff_threshold(options.size_diff_threshold)
+        .with_max_matches_per_doc(options.max_matches_per_doc);
 
     // Run parallel deduplication (writes matches to disk, doesn't keep in memory)
-    let stats = deduper.run(num_workers, &state_path, !fresh, new_doc_ids)?;
+    let stats = deduper.run(
+        options.num_workers,
+        &state_path,
+        !options.fresh,
+        options.new_doc_ids,
+    )?;
 
     tracing::info!("=== Results ===");
     tracing::info!("Documents processed: {}", stats.total_documents);
@@ -1027,7 +1107,17 @@ mod tests {
         }));
 
         assert!(deduper
-            .flush_pending_writes(&pending, &state_store, &total_written, 1, 1, 1)
+            .flush_pending_writes(
+                &pending,
+                &state_store,
+                &total_written,
+                Phase2FlushSnapshot {
+                    duplicates_found: 1,
+                    candidates_checked: 1,
+                    processed_this_run: 1,
+                    remaining_docs: 1,
+                },
+            )
             .unwrap());
 
         assert_eq!(deduper.count_matches().unwrap(), 1);

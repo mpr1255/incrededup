@@ -35,6 +35,7 @@ pub mod lsh;
 pub mod minhash;
 pub mod sources;
 pub mod storage;
+pub mod tokenizer;
 pub mod union_find;
 
 // Re-export main types
@@ -51,7 +52,10 @@ pub use cleanup::{
     PathologicalCluster,
 };
 pub use cli::{Args, EdgeLookupArg};
-pub use disk_dedupe::{run_disk_dedupe, DiskDedupeStats, DiskDeduplicator};
+pub use disk_dedupe::{
+    run_disk_dedupe, run_disk_dedupe_with_options, DiskDedupeRunOptions, DiskDedupeStats,
+    DiskDeduplicator,
+};
 pub use lsh::{DiskLSH, InMemoryLSH};
 pub use minhash::{
     calculate_band_hash, compute_band_hashes, jaccard_from_signatures, try_compute_band_hashes,
@@ -63,5 +67,9 @@ pub use sources::{
 pub use storage::{
     DatasetStorage, FilteredParentStore, MatchRecord, MatchStore, StateStore, SyncProgress,
     SyncStep,
+};
+pub use tokenizer::{
+    compute_signature, compute_signature_with_ngram_width, normalize_content, tokenize,
+    tokenize_with_ngram_width, DEFAULT_CHAR_NGRAM_WIDTH, TOKENIZER_VERSION,
 };
 pub use union_find::UnionFind;

@@ -157,6 +157,10 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "scan")]
     pub edge_lookup: EdgeLookupArg,
 
+    /// Keep only the top-M Phase 2 matches per processed document; 0 disables the cap
+    #[arg(long, default_value = "0")]
+    pub max_matches_per_doc: usize,
+
     /// Sync matches to PostgreSQL with transitivity resolution.
     ///
     /// Point to a sidecar directory containing matches.redb.

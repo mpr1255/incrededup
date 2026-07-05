@@ -12,23 +12,8 @@ use common::{
     create_temp_dir, generate_different_pair, generate_duplicate_pair, generate_similar_pair,
     generate_unique_documents,
 };
+use incrededup::compute_signature;
 use incrededup::lsh::{DiskLSH, InMemoryLSH};
-use incrededup::minhash::{RMinHash, NUM_PERM};
-
-/// Tokenize and compute signature (matching main implementation)
-fn compute_signature(content: &str, seed: u64) -> Vec<u32> {
-    let words: Vec<&str> = content.split_whitespace().filter(|w| w.len() > 1).collect();
-
-    let tokens: Vec<String> = if words.len() < 3 {
-        words.iter().map(|s| s.to_string()).collect()
-    } else {
-        words.windows(3).map(|w| w.join(" ")).collect()
-    };
-
-    let mut minhash = RMinHash::new(NUM_PERM, seed);
-    minhash.update(&tokens);
-    minhash.digest_owned()
-}
 
 // ============================================================================
 // In-Memory LSH Tests

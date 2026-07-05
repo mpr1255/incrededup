@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Fixed:
+
+1. Replaced word shingling with the unicode char-3-gram tokenizer used by the
+   Workbench deduper, fixing false negatives for Chinese and other text without
+   whitespace-delimited words.
+2. Refuse populated legacy LSH sidecars that lack tokenizer/hash metadata,
+   because they cannot be proven compatible with the current tokenizer.
+3. Stream Phase 3 connected-edge resolution from `matches.redb` instead of
+   materializing the full component edge set in memory.
+4. Added `--max-matches-per-doc` to bound per-document match fanout for very
+   dense duplicate clusters.
+
 ## 0.2.4 - 2026-06-24
 
 Initial public release candidate.

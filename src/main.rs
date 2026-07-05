@@ -21,8 +21,8 @@ use chrono::Local;
 use clap::Parser;
 use futures::future::join_all;
 use incrededup::{
-    resolve_transitivity, run_dedupe, run_disk_dedupe, Args, DbConfig, DbPool, DedupeConfig,
-    FilteredParentStore, MatchStore,
+    resolve_transitivity, run_dedupe, run_disk_dedupe_with_options, Args, DbConfig, DbPool,
+    DedupeConfig, DiskDedupeRunOptions, FilteredParentStore, MatchStore,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -71,6 +71,10 @@ fn is_search_index_corruption_error(error: &anyhow::Error) -> bool {
         || (message.contains("unexpectedend") && message.contains("deserialize"))
         || (message.contains("tantivy") && message.contains("corrupt"))
         || (message.contains("pg_search") && message.contains("corrupt"))
+}
+
+fn max_matches_per_doc(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
 }
 
 /// Release memory back to the OS with glibc malloc_trim where available.
@@ -380,6 +384,7 @@ async fn main() -> Result<()> {
                         disk_phase2: true, // Daemon mode always uses disk-backed Phase 2.
                         min_content_length: args.min_content_len,
                         edge_lookup_mode: args.edge_lookup.into(),
+                        max_matches_per_doc: max_matches_per_doc(args.max_matches_per_doc),
                     };
 
                     log_memory(&format!("Before processing SQLite dataset {}", source_name));
@@ -567,6 +572,7 @@ async fn main() -> Result<()> {
                         disk_phase2: true,
                         min_content_length: args.min_content_len,
                         edge_lookup_mode: args.edge_lookup.into(),
+                        max_matches_per_doc: max_matches_per_doc(args.max_matches_per_doc),
                     };
 
                     log_memory(&format!(
@@ -809,6 +815,7 @@ async fn main() -> Result<()> {
                         disk_phase2: true, // Daemon mode always uses disk-backed Phase 2.
                         min_content_length: args.min_content_len,
                         edge_lookup_mode: args.edge_lookup.into(),
+                        max_matches_per_doc: max_matches_per_doc(args.max_matches_per_doc),
                     };
 
                     let run_result = run_dedupe(db_config.clone(), dedupe_config.clone()).await;
@@ -936,17 +943,20 @@ async fn main() -> Result<()> {
                     None
                 }
             }
-            // lsh is dropped here, releasing the lock for run_disk_dedupe
+            // lsh is dropped here, releasing the lock for run_disk_dedupe_with_options
         };
 
-        let stats = run_disk_dedupe(
+        let stats = run_disk_dedupe_with_options(
             &lsh_path,
             &output_dir,
-            num_workers,
-            args.threshold,
-            args.size_diff,
-            args.fresh,
-            doc_ids_to_process,
+            DiskDedupeRunOptions {
+                num_workers,
+                threshold: args.threshold,
+                size_diff_threshold: args.size_diff,
+                fresh: args.fresh,
+                new_doc_ids: doc_ids_to_process,
+                max_matches_per_doc: max_matches_per_doc(args.max_matches_per_doc),
+            },
         )?;
 
         info!("");
@@ -1003,6 +1013,7 @@ async fn main() -> Result<()> {
             disk_phase2: true,
             min_content_length: args.min_content_len,
             edge_lookup_mode: args.edge_lookup.into(),
+            max_matches_per_doc: max_matches_per_doc(args.max_matches_per_doc),
         };
         if args.memory {
             warn!("--memory is deprecated and ignored; using disk-backed Phase 2");
@@ -1070,6 +1081,7 @@ async fn main() -> Result<()> {
             disk_phase2: true,
             min_content_length: args.min_content_len,
             edge_lookup_mode: args.edge_lookup.into(),
+            max_matches_per_doc: max_matches_per_doc(args.max_matches_per_doc),
         };
         if args.memory {
             warn!("--memory is deprecated and ignored; using disk-backed Phase 2");
