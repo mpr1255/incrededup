@@ -172,7 +172,7 @@ where
             if let Some(mb) = current_rss_mb() {
                 peak_rss_mb = Some(peak_rss_mb.map_or(mb, |peak| peak.max(mb)));
             }
-            if edges_seen % LOG_EVERY == 0 {
+            if edges_seen.is_multiple_of(LOG_EVERY) {
                 match peak_rss_mb {
                     Some(peak) => info!(
                         "Phase 3 {} for {} streamed {} edges so far; peak RSS {:.1} MB",

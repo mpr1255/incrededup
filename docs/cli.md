@@ -7,7 +7,7 @@ not edit it by hand. Regenerate it with:
 cargo run --example generate_cli_docs
 ```
 
-Version: `incrededup 0.3.0`
+Version: `incrededup 0.3.1`
 
 The option order follows the declaration order in `src/cli.rs`: input and mode
 selection first, then matching parameters, state/write controls, daemon
