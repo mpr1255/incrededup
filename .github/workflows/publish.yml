@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      yank_version:
-        description: "Crate version to yank from crates.io"
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -21,7 +15,6 @@ concurrency:
 
 jobs:
   publish:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: release
@@ -69,32 +62,3 @@ jobs:
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-  yank:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: release
-
-    steps:
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Validate version
-        shell: bash
-        env:
-          YANK_VERSION: ${{ inputs.yank_version }}
-        run: |
-          if [[ ! "$YANK_VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
-            echo "Refusing to yank invalid version: $YANK_VERSION" >&2
-            exit 1
-          fi
-
-      - name: Authenticate with crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1
-
-      - name: Yank version
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          YANK_VERSION: ${{ inputs.yank_version }}
-        run: cargo yank --version "$YANK_VERSION" incrededup
