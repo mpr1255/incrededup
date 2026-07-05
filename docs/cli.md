@@ -141,6 +141,11 @@ Options:
           
           [default: scan]
 
+      --max-matches-per-doc <MAX_MATCHES_PER_DOC>
+          Keep only the top-M Phase 2 matches per processed document; 0 disables the cap
+          
+          [default: 0]
+
       --sync <SYNC>
           Sync matches to PostgreSQL with transitivity resolution.
           
